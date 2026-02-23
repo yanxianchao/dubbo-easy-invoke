@@ -1,0 +1,20 @@
+package com.github.yanxianchao.dubboeasyinvoke.toolwindow;
+
+import com.github.yanxianchao.dubboeasyinvoke.ui.DubboInvokePanel;
+import com.intellij.openapi.project.DumbAware;
+import com.intellij.openapi.project.Project;
+import com.intellij.openapi.wm.ToolWindow;
+import com.intellij.openapi.wm.ToolWindowFactory;
+import com.intellij.ui.content.Content;
+import com.intellij.ui.content.ContentFactory;
+import org.jetbrains.annotations.NotNull;
+
+public final class DubboInvokeToolWindowFactory implements ToolWindowFactory, DumbAware {
+
+    @Override
+    public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
+        DubboInvokePanel panel = new DubboInvokePanel();
+        Content content = ContentFactory.getInstance().createContent(panel.getComponent(), "", false);
+        toolWindow.getContentManager().addContent(content);
+    }
+}

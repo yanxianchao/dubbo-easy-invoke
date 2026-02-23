@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.github.yanxianchao.dubboeasyinvoke</id>
+    <name>Dubbo Easy Invoke</name>
+    <vendor email="xianchao.yan@qq.com" url="https://github.com/yanxianchao">xianchao</vendor>
+
+    <idea-version since-build="252.25557"/>
+
+    <description><![CDATA[
+    <h3>Dubbo Easy Invoke</h3>
+    <p>在 IntelliJ IDEA 右侧提供 Dubbo 接口调用面板：</p>
+    <ul>
+        <li>设置页配置 Zookeeper 地址</li>
+        <li>应用和接口下拉联动，支持关键字模糊匹配</li>
+        <li>参数与结果自动 JSON 美化</li>
+    </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationConfigurable
+                id="com.github.yanxianchao.dubboeasyinvoke.settings"
+                displayName="Dubbo Easy Invoke"
+                parentId="tools"
+                instance="com.github.yanxianchao.dubboeasyinvoke.settings.DubboInvokeSettingsConfigurable"/>
+
+        <toolWindow
+                id="Dubbo Invoke"
+                anchor="right"
+                canCloseContents="false"
+                factoryClass="com.github.yanxianchao.dubboeasyinvoke.toolwindow.DubboInvokeToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
