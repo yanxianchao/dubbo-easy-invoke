@@ -8,11 +8,13 @@
 
     <description><![CDATA[
     <h3>Dubbo Easy Invoke</h3>
-    <p>在 IntelliJ IDEA 右侧提供 Dubbo 接口调用面板：</p>
+    <p>在 IntelliJ IDEA 内完成 Dubbo 联调闭环：发现接口、快速调用、解析信息、收藏复用。</p>
     <ul>
-        <li>设置页配置 Zookeeper 地址</li>
-        <li>应用和接口下拉联动，支持关键字模糊匹配</li>
-        <li>参数与结果自动 JSON 美化</li>
+        <li>接口发现：应用/接口联动 + 关键字实时搜索</li>
+        <li>快速调用：参数/结果自动 JSON 格式化，支持一键粘贴与复制</li>
+        <li>接口解析：服务地址、消费方、超时时间、接口包版本、DUBBO 版本清晰展示</li>
+        <li>收藏夹：按应用筛选、关键字搜索、重命名、删除与一键回填</li>
+        <li>稳定体验：缓存优先加载、后台刷新、注册中心异常回退、分色 Console 日志</li>
     </ul>
     ]]></description>
 

@@ -3,6 +3,7 @@ package com.github.yanxianchao.dubboeasyinvoke.ui;
 import com.github.yanxianchao.dubboeasyinvoke.invoke.DubboTelnetClient;
 import com.github.yanxianchao.dubboeasyinvoke.model.DiscoverySnapshot;
 import com.github.yanxianchao.dubboeasyinvoke.model.DubboMethodEndpoint;
+import com.github.yanxianchao.dubboeasyinvoke.model.InvokeFavorite;
 import com.github.yanxianchao.dubboeasyinvoke.registry.ZooKeeperDubboRegistryClient;
 import com.github.yanxianchao.dubboeasyinvoke.settings.DubboInvokeSettingsService;
 import com.github.yanxianchao.dubboeasyinvoke.util.JsonFormatter;
@@ -17,9 +18,11 @@ import com.intellij.ui.components.JBTextArea;
 import com.intellij.util.ui.FormBuilder;
 import com.intellij.util.ui.JBUI;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import javax.swing.JButton;
 import javax.swing.JComponent;
+import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.SwingConstants;
@@ -35,6 +38,9 @@ import java.awt.Color;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.FocusAdapter;
@@ -45,11 +51,30 @@ import java.awt.event.ComponentEvent;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * 插件主界面（Tool Window）：
+ * 1) 负责 UI 交互；
+ * 2) 调用注册中心加载接口；
+ * 3) 触发 Dubbo 调用；
+ * 4) 维护收藏、控制台输出等状态。
+ *
+ * <p>这个类偏“编排层”，真正的数据获取和网络调用分别交给
+ * {@link ZooKeeperDubboRegistryClient} 与 {@link DubboTelnetClient}。</p>
+ */
 public final class DubboInvokePanel {
 
     private static final DateTimeFormatter CONSOLE_TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final String[] RESOLVE_DETAIL_LABELS = {
+            "接口名称",
+            "服务地址",
+            "消费方",
+            "超时时间",
+            "接口包版本",
+            "DUBBO版本"
+    };
 
     private final JPanel mainPanel;
 
@@ -63,7 +88,9 @@ public final class DubboInvokePanel {
     private final JButton copyParamButton = new JButton("复制入参");
     private final JButton copyResultButton = new JButton("复制结果");
     private final JButton invokeButton = new JButton("调用接口");
-    private final JButton resolveAddressButton = new JButton("解析地址");
+    private final JButton resolveAddressButton = new JButton("解析接口");
+    private final JButton favoriteCurrentButton = new JButton("收藏当前");
+    private final JButton favoritesButton = new JButton("收藏夹");
     private final JButton resetButton = new JButton("重置");
 
     private final JBTextArea parameterTextArea = new JBTextArea();
@@ -179,11 +206,9 @@ public final class DubboInvokePanel {
         appActionPanel.setLayout(new javax.swing.BoxLayout(appActionPanel, javax.swing.BoxLayout.X_AXIS));
         appActionPanel.add(refreshButton);
         appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(6)));
-        appActionPanel.add(pasteParamButton);
+        appActionPanel.add(favoriteCurrentButton);
         appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(6)));
-        appActionPanel.add(copyParamButton);
-        appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(6)));
-        appActionPanel.add(copyResultButton);
+        appActionPanel.add(favoritesButton);
 
         JPanel appRow = new JPanel();
         appRow.setLayout(new javax.swing.BoxLayout(appRow, javax.swing.BoxLayout.X_AXIS));
@@ -193,17 +218,26 @@ public final class DubboInvokePanel {
         appRow.add(javax.swing.Box.createHorizontalGlue());
         installAdaptiveAppComboWidth(appRow, appActionPanel, appComboHeight);
 
-        JPanel interfaceRow = new JPanel(new BorderLayout());
+        JPanel interfaceRow = new JPanel(new BorderLayout(JBUI.scale(8), 0));
         interfaceRow.add(interfaceComboBox, BorderLayout.CENTER);
 
         JPanel actionPanel = new JPanel();
         actionPanel.setLayout(new javax.swing.BoxLayout(actionPanel, javax.swing.BoxLayout.Y_AXIS));
         invokeButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
         resolveAddressButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
+        pasteParamButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
+        copyParamButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
+        copyResultButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
         resetButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
         actionPanel.add(invokeButton);
         actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
         actionPanel.add(resolveAddressButton);
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(pasteParamButton);
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(copyParamButton);
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(copyResultButton);
         actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
         actionPanel.add(resetButton);
 
@@ -249,12 +283,30 @@ public final class DubboInvokePanel {
                 .addLabeledComponent("入参", parameterRow, 1, false)
                 .addLabeledComponent("结果", resultScroll, 1, false)
                 .getPanel();
+        adjustFormLabelAnchor(topPanel, resultScroll, GridBagConstraints.WEST);
 
         JPanel rootPanel = new JPanel(new BorderLayout(0, JBUI.scale(8)));
-        rootPanel.setBorder(JBUI.Borders.empty(12, 12, 0, 12));
+        rootPanel.setBorder(JBUI.Borders.empty(2, 12, 0, 12));
         rootPanel.add(topPanel, BorderLayout.CENTER);
         rootPanel.add(consolePanel, BorderLayout.SOUTH);
         return rootPanel;
+    }
+
+    private void adjustFormLabelAnchor(@NotNull JPanel formPanel, @NotNull JComponent labeledComponent, int anchor) {
+        if (!(formPanel.getLayout() instanceof GridBagLayout gridBagLayout)) {
+            return;
+        }
+
+        for (java.awt.Component component : formPanel.getComponents()) {
+            if (!(component instanceof JLabel label) || label.getLabelFor() != labeledComponent) {
+                continue;
+            }
+
+            GridBagConstraints constraints = gridBagLayout.getConstraints(component);
+            constraints.anchor = anchor;
+            gridBagLayout.setConstraints(component, constraints);
+            return;
+        }
     }
 
     private void installAdaptiveAppComboWidth(@NotNull JPanel appRow, @NotNull JPanel appActionPanel, int comboHeight) {
@@ -298,6 +350,8 @@ public final class DubboInvokePanel {
         copyResultButton.addActionListener(event -> copyTextToClipboard(resultTextArea.getText(), "结果"));
         invokeButton.addActionListener(event -> invokeSelectedInterface());
         resolveAddressButton.addActionListener(event -> resolveSelectedInterfaceAddress());
+        favoriteCurrentButton.addActionListener(event -> saveCurrentFavorite());
+        favoritesButton.addActionListener(event -> openFavoritesDialog());
         resetButton.addActionListener(event -> resetInputs());
 
         applicationComboBox.addItemListener(event -> {
@@ -323,6 +377,7 @@ public final class DubboInvokePanel {
             return;
         }
 
+        // 通过递增请求号防止并发请求“后到先覆盖”的问题。
         long requestId = refreshRequestSeq.incrementAndGet();
         setBusyState(true, "正在加载应用和接口...");
         ApplicationManager.getApplication().executeOnPooledThread(() -> {
@@ -418,6 +473,7 @@ public final class DubboInvokePanel {
 
         String selectedApp = applicationSearchController.getSelectedItem();
         if (selectedApp == null || !apps.contains(selectedApp)) {
+            // 当历史选中值已失效（比如应用下线）时，自动回到第一个可用应用。
             selectedApp = apps.get(0);
             applicationSearchController.setSelectedItem(selectedApp);
         }
@@ -491,6 +547,97 @@ public final class DubboInvokePanel {
         setStatus("已重置入参与结果");
     }
 
+    private void saveCurrentFavorite() {
+        DubboMethodEndpoint endpoint = interfaceSearchController.getSelectedItem();
+        if (endpoint == null) {
+            setStatus("请先选择接口");
+            return;
+        }
+
+        FavoriteSaveDialog dialog = new FavoriteSaveDialog(
+                mainPanel,
+                endpoint.getDisplayName()
+        );
+        if (!dialog.showAndGet()) {
+            return;
+        }
+
+        try {
+            DubboInvokeSettingsService.FavoriteSaveResult result = DubboInvokeSettingsService.getInstance().saveFavorite(
+                    dialog.getFavoriteName(),
+                    endpoint,
+                    parameterTextArea.getText()
+            );
+            if (result.getAction() == DubboInvokeSettingsService.FavoriteSaveAction.CREATED) {
+                setStatus("已收藏: " + result.getFavorite().getName());
+                return;
+            }
+            setStatus("已更新收藏: " + result.getFavorite().getName());
+        } catch (IllegalArgumentException ex) {
+            setStatus("收藏失败: " + ex.getMessage());
+        }
+    }
+
+    private void openFavoritesDialog() {
+        FavoriteBrowserDialog dialog = new FavoriteBrowserDialog(mainPanel, DubboInvokeSettingsService.getInstance());
+        if (!dialog.showAndGet()) {
+            return;
+        }
+
+        InvokeFavorite favorite = dialog.getSelectedFavorite();
+        if (favorite == null) {
+            setStatus("未选择收藏接口");
+            return;
+        }
+        applyFavorite(favorite);
+    }
+
+    private void applyFavorite(@NotNull InvokeFavorite favorite) {
+        // 先回填入参，再尝试按“应用 + service + method”恢复接口选中状态。
+        parameterTextArea.setText(favorite.getParameterText());
+        parameterTextArea.setCaretPosition(0);
+        formatParameterIfJson();
+
+        List<String> applications = discoverySnapshot.getApplications();
+        if (!applications.contains(favorite.getApplication())) {
+            setStatus("已回填入参，但未找到应用 " + favorite.getApplication() + "，请刷新后重试");
+            return;
+        }
+
+        String currentSelectedApp = applicationSearchController.getSelectedItem();
+        if (!favorite.getApplication().equals(currentSelectedApp)) {
+            applicationSearchController.setSelectedItem(favorite.getApplication());
+        } else {
+            syncInterfacesByApplication(favorite.getApplication());
+        }
+        applyFavoriteInterfaceSelectionLater(favorite);
+    }
+
+    private void applyFavoriteInterfaceSelectionLater(@NotNull InvokeFavorite favorite) {
+        // 使用 invokeLater 等待应用切换引起的接口列表刷新完成，再做目标接口匹配。
+        SwingUtilities.invokeLater(() -> {
+            DubboMethodEndpoint endpoint = findEndpointForFavorite(favorite);
+            if (endpoint == null) {
+                setStatus("已回填入参，但未找到接口 " + favorite.getInterfaceDisplayName() + "，请刷新后重试");
+                return;
+            }
+
+            interfaceSearchController.setSelectedItem(endpoint);
+            setStatus("已应用收藏: " + favorite.getName());
+        });
+    }
+
+    private @Nullable DubboMethodEndpoint findEndpointForFavorite(@NotNull InvokeFavorite favorite) {
+        List<DubboMethodEndpoint> endpoints = discoverySnapshot.getInterfacesForApp(favorite.getApplication());
+        for (DubboMethodEndpoint endpoint : endpoints) {
+            if (favorite.getServiceName().equals(endpoint.getServiceName())
+                    && favorite.getMethodName().equals(endpoint.getMethodName())) {
+                return endpoint;
+            }
+        }
+        return null;
+    }
+
     private void pasteParameterFromClipboard() {
         String text = CopyPasteManager.getInstance().getContents(DataFlavor.stringFlavor);
         if (text == null || text.isBlank()) {
@@ -531,13 +678,123 @@ public final class DubboInvokePanel {
             setStatus("请先选择接口");
             return;
         }
-        logInvocationEndpoint(endpoint);
+        logResolvedInterfaceDetail(endpoint);
+        updateLatestStatus("接口解析完成", consoleSuccessStyle);
+    }
+
+    private void logResolvedInterfaceDetail(@NotNull DubboMethodEndpoint endpoint) {
+        if (!ApplicationManager.getApplication().isDispatchThread()) {
+            ApplicationManager.getApplication().invokeLater(() -> logResolvedInterfaceDetail(endpoint));
+            return;
+        }
+
+        String startTimestamp = LocalTime.now().format(CONSOLE_TIME_FORMATTER);
+        appendConsoleLine("[" + startTimestamp + "] -------- 解析接口 --------", consoleInfoStyle);
+        appendResolvedFieldLine("接口名称", endpoint.getDisplayName(), consoleInfoStyle);
+        appendResolvedFieldLine("服务地址", endpoint.getHost() + ":" + endpoint.getPort(), consoleEndpointStyle);
+
+        List<String> consumerApplications = endpoint.getConsumerApplications();
+        if (consumerApplications.isEmpty()) {
+            appendResolvedFieldLine("消费方", "未发现", consoleWarningStyle);
+        } else {
+            appendResolvedFieldLine("消费方", String.join("|", consumerApplications), consoleInfoStyle);
+        }
+
+        Integer timeoutMillis = endpoint.getTimeoutMillis();
+        if (timeoutMillis == null) {
+            appendResolvedFieldLine("超时时间", "未配置", consoleWarningStyle);
+        } else {
+            appendResolvedFieldLine("超时时间", timeoutMillis + " ms", consoleInfoStyle);
+        }
+
+        String serviceVersion = endpoint.getServiceVersion();
+        if (serviceVersion.isBlank()) {
+            appendResolvedFieldLine("接口包版本", "未配置", consoleWarningStyle);
+        } else {
+            appendResolvedFieldLine("接口包版本", serviceVersion, consoleInfoStyle);
+        }
+        String dubboVersion = endpoint.getDubboVersion();
+        if (dubboVersion.isBlank()) {
+            appendResolvedFieldLine("DUBBO版本", "未配置", consoleWarningStyle);
+        } else {
+            appendResolvedFieldLine("DUBBO版本", dubboVersion, consoleInfoStyle);
+        }
+
+        String endTimestamp = LocalTime.now().format(CONSOLE_TIME_FORMATTER);
+        appendConsoleLine("[" + endTimestamp + "] -------- 解析结束 --------", consoleSuccessStyle);
+    }
+
+    private void appendResolvedFieldLine(
+            @NotNull String label,
+            @NotNull String value,
+            @NotNull SimpleAttributeSet valueStyle
+    ) {
+        if (!ApplicationManager.getApplication().isDispatchThread()) {
+            ApplicationManager.getApplication().invokeLater(() -> appendResolvedFieldLine(label, value, valueStyle));
+            return;
+        }
+
+        StyledDocument document = consoleTextPane.getStyledDocument();
+        try {
+            int lineStartOffset = document.getLength();
+            if (document.getLength() > 0) {
+                document.insertString(document.getLength(), "\n", consoleInfoStyle);
+                lineStartOffset = document.getLength();
+            }
+            String prefix = buildResolvedFieldPrefix(label);
+            document.insertString(document.getLength(), prefix, consoleInfoStyle);
+            document.insertString(document.getLength(), value, valueStyle);
+            // 让超长内容换行后“从值列开始”，保证可读性。
+            applyResolvedFieldWrapIndent(document, lineStartOffset, prefix);
+            consoleTextPane.setCaretPosition(document.getLength());
+        } catch (BadLocationException ignored) {
+            // Ignore invalid position errors in UI logging.
+        }
+    }
+
+    private @NotNull String buildResolvedFieldPrefix(@NotNull String label) {
+        // 这里按像素宽度计算前缀对齐，不依赖字符数，避免中英文混排造成错位。
+        FontMetrics metrics = consoleTextPane.getFontMetrics(consoleTextPane.getFont());
+        int targetLabelWidth = 0;
+        for (String candidate : RESOLVE_DETAIL_LABELS) {
+            targetLabelWidth = Math.max(targetLabelWidth, metrics.stringWidth(candidate));
+        }
+
+        int labelWidth = metrics.stringWidth(label);
+        int spaceWidth = Math.max(1, metrics.charWidth(' '));
+        int paddingWidth = Math.max(0, targetLabelWidth - labelWidth) + (spaceWidth * 2);
+        int spaceCount = Math.max(1, (paddingWidth + spaceWidth - 1) / spaceWidth);
+        return label + " ".repeat(spaceCount) + ": ";
+    }
+
+    private void applyResolvedFieldWrapIndent(
+            @NotNull StyledDocument document,
+            int lineStartOffset,
+            @NotNull String prefix
+    ) {
+        if (lineStartOffset < 0 || lineStartOffset >= document.getLength() || prefix.isEmpty()) {
+            return;
+        }
+
+        FontMetrics metrics = consoleTextPane.getFontMetrics(consoleTextPane.getFont());
+        float prefixWidth = Math.max(0, metrics.stringWidth(prefix));
+        if (prefixWidth <= 0) {
+            return;
+        }
+
+        SimpleAttributeSet paragraphStyle = new SimpleAttributeSet();
+        StyleConstants.setLeftIndent(paragraphStyle, prefixWidth);
+        StyleConstants.setFirstLineIndent(paragraphStyle, -prefixWidth);
+        document.setParagraphAttributes(lineStartOffset, document.getLength() - lineStartOffset, paragraphStyle, false);
     }
 
     private void setBusyState(boolean busy, @NotNull String message) {
+        // 一次性切换所有交互控件，避免某个按钮遗漏导致并发操作。
         refreshButton.setEnabled(!busy);
         invokeButton.setEnabled(!busy);
         resolveAddressButton.setEnabled(!busy);
+        favoriteCurrentButton.setEnabled(!busy);
+        favoritesButton.setEnabled(!busy);
         resetButton.setEnabled(!busy);
         applicationComboBox.setEnabled(!busy);
         interfaceComboBox.setEnabled(!busy);
@@ -559,8 +816,17 @@ public final class DubboInvokePanel {
         String logLine = "[" + timestamp + "] " + cleanText;
         SimpleAttributeSet logStyle = resolveConsoleStyle(cleanText);
         appendConsoleLine(logLine, logStyle);
-        consoleLatestLabel.setText(cleanText);
-        consoleLatestLabel.setForeground(StyleConstants.getForeground(logStyle));
+        // latest 区只显示最后一条状态，作为“当前态提示”。
+        updateLatestStatus(cleanText, logStyle);
+    }
+
+    private void updateLatestStatus(@NotNull String text, @NotNull SimpleAttributeSet style) {
+        if (!ApplicationManager.getApplication().isDispatchThread()) {
+            ApplicationManager.getApplication().invokeLater(() -> updateLatestStatus(text, style));
+            return;
+        }
+        consoleLatestLabel.setText(text);
+        consoleLatestLabel.setForeground(StyleConstants.getForeground(style));
     }
 
     private void appendConsoleLine(@NotNull String logLine, @NotNull SimpleAttributeSet logStyle) {
@@ -593,9 +859,9 @@ public final class DubboInvokePanel {
     }
 
     private boolean containsAny(@NotNull String message, @NotNull String... tokens) {
-        String normalized = message.toLowerCase();
+        String normalized = message.toLowerCase(Locale.ROOT);
         for (String token : tokens) {
-            if (normalized.contains(token.toLowerCase())) {
+            if (normalized.contains(token.toLowerCase(Locale.ROOT))) {
                 return true;
             }
         }

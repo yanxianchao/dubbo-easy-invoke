@@ -7,6 +7,12 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+/**
+ * JSON 相关的纯工具类：
+ * 1) 输入参数自动美化；
+ * 2) 入参转换为 Dubbo telnet 可直接使用的表达式；
+ * 3) 调用结果尝试格式化展示。
+ */
 public final class JsonFormatter {
 
     private static final ObjectMapper PRETTY_MAPPER = new ObjectMapper()
@@ -46,7 +52,7 @@ public final class JsonFormatter {
 
         try {
             // 统一保留 JSON 根结构：对象/数组/标量都按紧凑 JSON 透传。
-            // 这样像 [123] 这种 List/数组入参不会被拆成 123。
+            // 例如 [123] 仍然是数组，不会被错误改写成单个数字 123。
             return COMPACT_MAPPER.writeValueAsString(jsonNode);
         } catch (JsonProcessingException ignored) {
             return trimmed;

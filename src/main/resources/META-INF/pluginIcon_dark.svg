@@ -1,0 +1,16 @@
+<svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgDarkB" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF8A63;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#F36A1A;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <circle cx="20" cy="20" r="18" fill="url(#bgDarkB)"/>
+  <text x="20" y="25.3" text-anchor="middle"
+        font-family="Arial, sans-serif"
+        font-size="12.8"
+        font-weight="bold"
+        letter-spacing="0.4"
+        fill="#111111">DEI</text>
+</svg>

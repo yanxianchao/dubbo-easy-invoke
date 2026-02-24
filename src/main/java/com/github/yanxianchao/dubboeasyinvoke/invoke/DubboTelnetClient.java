@@ -12,6 +12,11 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 
+/**
+ * 通过 Dubbo telnet 协议发起一次调用。
+ *
+ * <p>流程非常直接：连上 provider -> 等提示符 -> 写入 invoke 命令 -> 读回响应并提取 result 区段。</p>
+ */
 public final class DubboTelnetClient {
 
     private static final int CONNECT_TIMEOUT_MS = 4000;
@@ -44,6 +49,7 @@ public final class DubboTelnetClient {
 
     private @NotNull String send(@NotNull String host, int port, @NotNull String command) throws IOException {
         try (Socket socket = new Socket()) {
+            // 连接超时与读取超时分开控制，避免网络抖动时 UI 长时间卡住。
             socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
             socket.setSoTimeout(READ_TIMEOUT_MS);
 
@@ -89,6 +95,10 @@ public final class DubboTelnetClient {
     }
 
     private @NotNull String extractResult(@NotNull String rawResponse) {
+        // Dubbo telnet 常见输出格式：
+        // result: xxx
+        // elapsed: xx ms.
+        // 这里优先抽取 result 区块；拿不到时再兜底返回清洗后的原文。
         String[] lines = rawResponse.split("\\R");
         StringBuilder resultBuilder = new StringBuilder();
         boolean collectingResult = false;

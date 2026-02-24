@@ -9,6 +9,11 @@ import com.intellij.ui.content.Content;
 import com.intellij.ui.content.ContentFactory;
 import org.jetbrains.annotations.NotNull;
 
+/**
+ * IDEA Tool Window 入口工厂。
+ *
+ * <p>IDE 启动后由平台回调此类，把 {@link DubboInvokePanel} 挂到右侧工具窗口。</p>
+ */
 public final class DubboInvokeToolWindowFactory implements ToolWindowFactory, DumbAware {
 
     @Override

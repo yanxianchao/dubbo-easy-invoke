@@ -18,8 +18,15 @@ import java.awt.event.InputMethodListener;
 import java.text.AttributedCharacterIterator;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Function;
 
+/**
+ * 可搜索下拉框控制器（支持实时过滤 + 中文输入法友好处理）。
+ *
+ * <p>核心目标是：用户输入关键字时不断过滤列表，同时尽量不打断输入体验
+ * （例如 IME 组合输入阶段不做回写）。</p>
+ */
 public final class SearchableComboBoxController<T> {
 
     private final ComboBox<T> comboBox;
@@ -111,6 +118,15 @@ public final class SearchableComboBoxController<T> {
                 return item;
             }
         }
+        if (selected == null) {
+            return null;
+        }
+
+        // 兼容“编辑器里是文本但 model 里还没选中对象”的场景。
+        T textMatched = findExactTextMatch(selected.toString());
+        if (textMatched != null) {
+            return textMatched;
+        }
         return null;
     }
 
@@ -145,11 +161,11 @@ public final class SearchableComboBoxController<T> {
     }
 
     private void filterByKeyword(@NotNull String keyword) {
-        String normalized = keyword.toLowerCase();
+        String normalized = keyword.toLowerCase(Locale.ROOT);
         List<T> filtered = new ArrayList<>();
         for (T item : allItems) {
             String text = textProvider.apply(item);
-            if (normalized.isEmpty() || text.toLowerCase().contains(normalized)) {
+            if (normalized.isEmpty() || text.toLowerCase(Locale.ROOT).contains(normalized)) {
                 filtered.add(item);
             }
         }
@@ -172,8 +188,13 @@ public final class SearchableComboBoxController<T> {
             if (keepSelection) {
                 comboBox.setSelectedItem(selected);
             } else {
-                // 让编辑器持有当前关键字，避免在展开下拉时被 Swing 以 null 选中值清空。
-                comboBox.setSelectedItem(keyword);
+                T exactMatched = findExactTextMatch(keyword);
+                if (exactMatched != null && filtered.contains(exactMatched)) {
+                    comboBox.setSelectedItem(exactMatched);
+                } else {
+                    // 让编辑器持有当前关键字，避免在展开下拉时被 Swing 以 null 选中值清空。
+                    comboBox.setSelectedItem(keyword);
+                }
             }
 
             if (editorField != null && !imeComposing) {
@@ -219,6 +240,7 @@ public final class SearchableComboBoxController<T> {
         if (filterUpdateScheduled) {
             return;
         }
+        // 合并同一事件循环中的多次输入，避免频繁重建 model。
         filterUpdateScheduled = true;
         SwingUtilities.invokeLater(() -> {
             filterUpdateScheduled = false;
@@ -275,7 +297,19 @@ public final class SearchableComboBoxController<T> {
                     editorField.setCaretPosition(selectedText.length());
                 }
             } else {
-                comboBox.setSelectedItem(getEditorTextRaw());
+                T exactMatched = findExactTextMatch(getEditorTextRaw());
+                if (exactMatched != null) {
+                    comboBox.setSelectedItem(exactMatched);
+                    if (editorField != null) {
+                        String selectedText = textProvider.apply(exactMatched);
+                        if (!selectedText.equals(editorField.getText())) {
+                            editorField.setText(selectedText);
+                        }
+                        editorField.setCaretPosition(selectedText.length());
+                    }
+                } else {
+                    comboBox.setSelectedItem(getEditorTextRaw());
+                }
             }
         } finally {
             internalUpdate = false;
@@ -287,5 +321,27 @@ public final class SearchableComboBoxController<T> {
                 comboBox.showPopup();
             }
         });
+    }
+
+    private @Nullable T findExactTextMatch(@Nullable String text) {
+        if (text == null) {
+            return null;
+        }
+        String keyword = text.trim();
+        if (keyword.isEmpty()) {
+            return null;
+        }
+
+        T ignoreCaseMatched = null;
+        for (T item : allItems) {
+            String itemText = textProvider.apply(item);
+            if (itemText.equals(keyword)) {
+                return item;
+            }
+            if (ignoreCaseMatched == null && itemText.equalsIgnoreCase(keyword)) {
+                ignoreCaseMatched = item;
+            }
+        }
+        return ignoreCaseMatched;
     }
 }

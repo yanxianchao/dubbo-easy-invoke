@@ -37,6 +37,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * Dubbo 注册中心读取器（Zookeeper 实现）。
+ *
+ * <p>职责：
+ * 1) 从 /dubbo 下扫描 provider/consumer；
+ * 2) 组装成 {@link DiscoverySnapshot}；
+ * 3) 提供内存 + 磁盘双层缓存，提升 UI 打开速度并在网络异常时兜底。</p>
+ */
 public final class ZooKeeperDubboRegistryClient {
 
     private static final String DUBBO_ROOT = "/dubbo";
@@ -66,6 +74,7 @@ public final class ZooKeeperDubboRegistryClient {
         long now = System.currentTimeMillis();
 
         if (!forceRefresh) {
+            // 优先读缓存：先内存，后磁盘。
             DiscoverySnapshot memoryHit = getMemoryCache(normalizedAddress, now);
             if (memoryHit != null) {
                 return new DiscoverResult(memoryHit, DataSource.MEMORY_CACHE);
@@ -79,11 +88,13 @@ public final class ZooKeeperDubboRegistryClient {
         }
 
         try {
+            // 缓存未命中或强制刷新时，走网络拉取。
             DiscoverySnapshot fresh = discoverFromZooKeeper(normalizedAddress);
             putMemoryCache(normalizedAddress, fresh, now);
             writeDiskCache(normalizedAddress, fresh, now);
             return new DiscoverResult(fresh, DataSource.NETWORK);
         } catch (Exception networkError) {
+            // 网络失败时允许回退到过期磁盘缓存，优先保证“能用”。
             DiscoverySnapshot fallback = readDiskCache(normalizedAddress, now, true);
             if (fallback != null) {
                 putMemoryCache(normalizedAddress, fallback, now);
@@ -111,6 +122,7 @@ public final class ZooKeeperDubboRegistryClient {
             ExecutorService executor = Executors.newFixedThreadPool(workerCount);
 
             try {
+                // 每个 service 节点并发拉取，明显减少大集群下的首屏等待。
                 List<Future<List<DubboMethodEndpoint>>> futures = new ArrayList<>(services.size());
                 for (String serviceNode : services) {
                     futures.add(executor.submit(() -> discoverEndpointsForService(zooKeeper, serviceNode)));
@@ -144,6 +156,7 @@ public final class ZooKeeperDubboRegistryClient {
             @NotNull String serviceNode
     ) {
         String providersPath = DUBBO_ROOT + "/" + serviceNode + "/providers";
+        List<String> consumerApplications = discoverConsumerApplications(zooKeeper, serviceNode);
 
         List<String> providers;
         try {
@@ -167,11 +180,63 @@ public final class ZooKeeperDubboRegistryClient {
                         providerNode.serviceName,
                         method,
                         providerNode.host,
-                        providerNode.port
+                        providerNode.port,
+                        providerNode.timeoutMillis,
+                        providerNode.serviceVersion,
+                        providerNode.dubboVersion,
+                        consumerApplications
                 ));
             }
         }
         return endpoints;
+    }
+
+    private @NotNull List<String> discoverConsumerApplications(@NotNull ZooKeeper zooKeeper, @NotNull String serviceNode) {
+        String consumersPath = DUBBO_ROOT + "/" + serviceNode + "/consumers";
+
+        List<String> consumers;
+        try {
+            consumers = zooKeeper.getChildren(consumersPath, false);
+        } catch (KeeperException.NoNodeException ignored) {
+            return List.of();
+        } catch (Exception ignored) {
+            return List.of();
+        }
+
+        if (consumers.isEmpty()) {
+            return List.of();
+        }
+
+        List<String> applications = new ArrayList<>();
+        for (String encodedConsumer : consumers) {
+            String consumerApplication = parseConsumerApplication(encodedConsumer);
+            if (consumerApplication == null) {
+                continue;
+            }
+            if (!containsIgnoreCase(applications, consumerApplication)) {
+                applications.add(consumerApplication);
+            }
+        }
+        if (applications.isEmpty()) {
+            return List.of();
+        }
+        applications.sort(String.CASE_INSENSITIVE_ORDER);
+        return List.copyOf(applications);
+    }
+
+    private @Nullable String parseConsumerApplication(@NotNull String encodedConsumer) {
+        try {
+            String decoded = URLDecoder.decode(encodedConsumer, StandardCharsets.UTF_8);
+            int queryIndex = decoded.indexOf('?');
+            String queryPart = queryIndex >= 0 ? decoded.substring(queryIndex + 1) : "";
+            Map<String, String> queryValues = parseQueryValues(queryPart);
+            return firstNonBlankOrNull(
+                    queryValues.get("application"),
+                    queryValues.get("remote.application")
+            );
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private void mergeEndpoint(
@@ -249,41 +314,64 @@ public final class ZooKeeperDubboRegistryClient {
                 return null;
             }
 
-            return new ProviderNode(metadata.application, serviceName, host, port, methods);
+            return new ProviderNode(
+                    metadata.application,
+                    serviceName,
+                    host,
+                    port,
+                    methods,
+                    metadata.timeoutMillis,
+                    metadata.serviceVersion,
+                    metadata.dubboVersion
+            );
         } catch (Exception ignored) {
             return null;
         }
     }
 
     private @NotNull ProviderMetadata parseProviderMetadata(@NotNull String queryPart) {
-        String application = null;
-        String remoteApplication = null;
-        String methods = null;
+        Map<String, String> queryValues = parseQueryValues(queryPart);
+        String application = queryValues.get("application");
+        String remoteApplication = queryValues.get("remote.application");
+        String methods = queryValues.get("methods");
+        String timeout = queryValues.get("timeout");
+        // “接口包版本”要求取 revision，不再读取 default.version。
+        String revision = queryValues.get("revision");
+        String dubbo = queryValues.get("dubbo");
+        String packageRevision = revision == null ? "" : revision.trim();
+        String dubboVersion = dubbo == null ? "" : dubbo.trim();
 
-        if (!queryPart.isBlank()) {
-            String[] pairs = queryPart.split("&");
-            for (String pair : pairs) {
-                if (pair.isBlank()) {
-                    continue;
-                }
+        return new ProviderMetadata(
+                firstNonBlank(application, remoteApplication, "unknown"),
+                methods == null ? "" : methods,
+                parsePositiveIntOrNull(timeout),
+                packageRevision,
+                dubboVersion
+        );
+    }
 
-                int splitIndex = pair.indexOf('=');
-                String rawKey = splitIndex >= 0 ? pair.substring(0, splitIndex) : pair;
-                String rawValue = splitIndex >= 0 ? pair.substring(splitIndex + 1) : "";
-                String key = URLDecoder.decode(rawKey, StandardCharsets.UTF_8);
-                String value = URLDecoder.decode(rawValue, StandardCharsets.UTF_8);
-
-                switch (key) {
-                    case "application" -> application = value;
-                    case "remote.application" -> remoteApplication = value;
-                    case "methods" -> methods = value;
-                    default -> {
-                    }
-                }
-            }
+    private @NotNull Map<String, String> parseQueryValues(@NotNull String queryPart) {
+        Map<String, String> values = new LinkedHashMap<>();
+        if (queryPart.isBlank()) {
+            return values;
         }
 
-        return new ProviderMetadata(firstNonBlank(application, remoteApplication, "unknown"), methods == null ? "" : methods);
+        String[] pairs = queryPart.split("&");
+        for (String pair : pairs) {
+            if (pair.isBlank()) {
+                continue;
+            }
+
+            int splitIndex = pair.indexOf('=');
+            String rawKey = splitIndex >= 0 ? pair.substring(0, splitIndex) : pair;
+            String rawValue = splitIndex >= 0 ? pair.substring(splitIndex + 1) : "";
+            String key = URLDecoder.decode(rawKey, StandardCharsets.UTF_8);
+            String value = URLDecoder.decode(rawValue, StandardCharsets.UTF_8);
+            if (!key.isBlank() && !values.containsKey(key)) {
+                values.put(key, value);
+            }
+        }
+        return values;
     }
 
     private @NotNull String firstNonBlank(@Nullable String first, @Nullable String second, @NotNull String fallback) {
@@ -294,6 +382,37 @@ public final class ZooKeeperDubboRegistryClient {
             return second;
         }
         return fallback;
+    }
+
+    private @Nullable String firstNonBlankOrNull(@Nullable String first, @Nullable String second) {
+        if (first != null && !first.isBlank()) {
+            return first;
+        }
+        if (second != null && !second.isBlank()) {
+            return second;
+        }
+        return null;
+    }
+
+    private @Nullable Integer parsePositiveIntOrNull(@Nullable String rawValue) {
+        if (rawValue == null || rawValue.isBlank()) {
+            return null;
+        }
+        try {
+            int value = Integer.parseInt(rawValue.trim());
+            return value > 0 ? value : null;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean containsIgnoreCase(@NotNull List<String> values, @NotNull String candidate) {
+        for (String value : values) {
+            if (value.equalsIgnoreCase(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private @NotNull List<String> splitMethods(@NotNull String methodsRaw) {
@@ -360,7 +479,11 @@ public final class ZooKeeperDubboRegistryClient {
                         endpoint.serviceName,
                         endpoint.methodName,
                         endpoint.host,
-                        endpoint.port
+                        endpoint.port,
+                        endpoint.timeoutMillis,
+                        endpoint.serviceVersion,
+                        endpoint.dubboVersion,
+                        endpoint.consumerApplications == null ? List.of() : endpoint.consumerApplications
                 );
                 mergeEndpoint(groupedByApp, rebuilt);
             }
@@ -422,23 +545,50 @@ public final class ZooKeeperDubboRegistryClient {
         private final String host;
         private final int port;
         private final List<String> methods;
+        private final Integer timeoutMillis;
+        private final String serviceVersion;
+        private final String dubboVersion;
 
-        private ProviderNode(String application, String serviceName, String host, int port, List<String> methods) {
+        private ProviderNode(
+                String application,
+                String serviceName,
+                String host,
+                int port,
+                List<String> methods,
+                @Nullable Integer timeoutMillis,
+                @NotNull String serviceVersion,
+                @NotNull String dubboVersion
+        ) {
             this.application = application;
             this.serviceName = serviceName;
             this.host = host;
             this.port = port;
             this.methods = methods;
+            this.timeoutMillis = timeoutMillis;
+            this.serviceVersion = serviceVersion;
+            this.dubboVersion = dubboVersion;
         }
     }
 
     private static final class ProviderMetadata {
         private final String application;
         private final String methodsRaw;
+        private final Integer timeoutMillis;
+        private final String serviceVersion;
+        private final String dubboVersion;
 
-        private ProviderMetadata(String application, String methodsRaw) {
+        private ProviderMetadata(
+                String application,
+                String methodsRaw,
+                @Nullable Integer timeoutMillis,
+                @NotNull String serviceVersion,
+                @NotNull String dubboVersion
+        ) {
             this.application = application;
             this.methodsRaw = methodsRaw;
+            this.timeoutMillis = timeoutMillis;
+            this.serviceVersion = serviceVersion;
+            this.dubboVersion = dubboVersion;
         }
     }
 
@@ -490,6 +640,10 @@ public final class ZooKeeperDubboRegistryClient {
         public String methodName;
         public String host;
         public int port;
+        public Integer timeoutMillis;
+        public String serviceVersion;
+        public String dubboVersion;
+        public List<String> consumerApplications = new ArrayList<>();
 
         private static @NotNull CacheEndpoint fromEndpoint(@NotNull DubboMethodEndpoint endpoint) {
             CacheEndpoint cacheEndpoint = new CacheEndpoint();
@@ -498,6 +652,10 @@ public final class ZooKeeperDubboRegistryClient {
             cacheEndpoint.methodName = endpoint.getMethodName();
             cacheEndpoint.host = endpoint.getHost();
             cacheEndpoint.port = endpoint.getPort();
+            cacheEndpoint.timeoutMillis = endpoint.getTimeoutMillis();
+            cacheEndpoint.serviceVersion = endpoint.getServiceVersion();
+            cacheEndpoint.dubboVersion = endpoint.getDubboVersion();
+            cacheEndpoint.consumerApplications = new ArrayList<>(endpoint.getConsumerApplications());
             return cacheEndpoint;
         }
     }

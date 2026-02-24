@@ -7,6 +7,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
+/**
+ * 一次“服务发现结果”的快照对象。
+ *
+ * <p>可以把它理解为：某一时刻从注册中心拿到的完整视图，
+ * 结构是 “应用名 -> 这个应用下可调用的接口列表”。
+ * UI 只依赖这个对象读数据，不直接读 Zookeeper，便于缓存和回放。</p>
+ */
 public final class DiscoverySnapshot {
 
     private static final DiscoverySnapshot EMPTY = new DiscoverySnapshot(Collections.emptyMap());
@@ -22,6 +29,7 @@ public final class DiscoverySnapshot {
     }
 
     public @NotNull List<String> getApplications() {
+        // 对应用名排序后返回，保证 UI 每次展示顺序稳定。
         return appToInterfaces.keySet().stream().sorted().toList();
     }
 
@@ -31,10 +39,6 @@ public final class DiscoverySnapshot {
 
     public int getApplicationCount() {
         return appToInterfaces.size();
-    }
-
-    public int getInterfaceCount(@NotNull String application) {
-        return getInterfacesForApp(application).size();
     }
 
     @Override

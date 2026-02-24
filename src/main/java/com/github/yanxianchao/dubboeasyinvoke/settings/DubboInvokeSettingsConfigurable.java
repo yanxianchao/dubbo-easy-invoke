@@ -1,6 +1,5 @@
 package com.github.yanxianchao.dubboeasyinvoke.settings;
 
-import com.intellij.openapi.options.Configurable;
 import com.intellij.openapi.options.SearchableConfigurable;
 import com.intellij.ui.components.JBLabel;
 import com.intellij.ui.components.JBTextField;
@@ -13,6 +12,11 @@ import org.jetbrains.annotations.Nullable;
 import javax.swing.JComponent;
 import javax.swing.JPanel;
 
+/**
+ * IDEA Settings 页面（Tools > Dubbo Easy Invoke）。
+ *
+ * <p>这里只配置注册中心地址，业务数据（收藏等）由 {@link DubboInvokeSettingsService} 统一管理。</p>
+ */
 public final class DubboInvokeSettingsConfigurable implements SearchableConfigurable {
 
     private JPanel mainPanel;
@@ -30,6 +34,7 @@ public final class DubboInvokeSettingsConfigurable implements SearchableConfigur
 
     @Override
     public @Nullable JComponent createComponent() {
+        // 这里是插件 Settings 页面的输入框，用于保存 Zookeeper 地址。
         zookeeperAddressField = new JBTextField();
         zookeeperAddressField.putClientProperty("JTextField.placeholderText", "例如：127.0.0.1:2181 或 zk1:2181,zk2:2181");
 
