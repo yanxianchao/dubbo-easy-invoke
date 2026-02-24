@@ -17,6 +17,7 @@ import com.intellij.ui.components.JBScrollPane;
 import com.intellij.ui.components.JBTextArea;
 import com.intellij.util.ui.FormBuilder;
 import com.intellij.util.ui.JBUI;
+import com.intellij.util.ui.UIUtil;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -36,6 +37,7 @@ import javax.swing.text.StyleConstants;
 import javax.swing.text.StyledDocument;
 import java.awt.Color;
 import java.awt.BorderLayout;
+import java.awt.Container;
 import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.FontMetrics;
@@ -67,12 +69,13 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class DubboInvokePanel {
 
     private static final DateTimeFormatter CONSOLE_TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static final int COMPACT_GAP = 4;
     private static final String[] RESOLVE_DETAIL_LABELS = {
             "接口名称",
             "服务地址",
-            "消费方",
+            "消费应用",
             "超时时间",
-            "接口包版本",
+            "二方包版本",
             "DUBBO版本"
     };
 
@@ -132,6 +135,7 @@ public final class DubboInvokePanel {
 
         initComboEditors();
         initTextAreas();
+        initCompactComponentStyles();
 
         mainPanel = buildLayout();
         bindActions();
@@ -146,16 +150,18 @@ public final class DubboInvokePanel {
         Object appEditor = applicationComboBox.getEditor().getEditorComponent();
         if (appEditor instanceof JTextField appField) {
             appField.putClientProperty("JTextField.placeholderText", "输入关键字筛选应用");
+            UIUtil.applyStyle(UIUtil.ComponentStyle.SMALL, appField);
         }
 
         Object interfaceEditor = interfaceComboBox.getEditor().getEditorComponent();
         if (interfaceEditor instanceof JTextField interfaceField) {
             interfaceField.putClientProperty("JTextField.placeholderText", "输入关键字筛选接口");
+            UIUtil.applyStyle(UIUtil.ComponentStyle.SMALL, interfaceField);
         }
     }
 
     private void initTextAreas() {
-        Font mono = new Font(Font.MONOSPACED, Font.PLAIN, JBUI.scale(13));
+        Font mono = new Font(Font.MONOSPACED, Font.PLAIN, JBUI.scale(11));
         parameterAutoFormatTimer.setRepeats(false);
 
         parameterTextArea.setFont(mono);
@@ -182,10 +188,33 @@ public final class DubboInvokePanel {
             }
         });
 
-        consoleTextPane.setFont(new Font(Font.MONOSPACED, Font.PLAIN, JBUI.scale(12)));
+        consoleTextPane.setFont(new Font(Font.MONOSPACED, Font.PLAIN, JBUI.scale(10)));
         consoleTextPane.setEditable(false);
         consoleLatestLabel.setHorizontalAlignment(SwingConstants.RIGHT);
         consoleLatestLabel.setForeground(JBColor.GRAY);
+    }
+
+    private void initCompactComponentStyles() {
+        UIUtil.ComponentStyle compactStyle = UIUtil.ComponentStyle.SMALL;
+        UIUtil.applyStyle(compactStyle, applicationComboBox);
+        UIUtil.applyStyle(compactStyle, interfaceComboBox);
+        UIUtil.applyStyle(compactStyle, consoleLatestLabel);
+
+        List<JButton> buttons = List.of(
+                refreshButton,
+                pasteParamButton,
+                copyParamButton,
+                copyResultButton,
+                invokeButton,
+                resolveAddressButton,
+                favoriteCurrentButton,
+                favoritesButton,
+                resetButton
+        );
+        for (JButton button : buttons) {
+            UIUtil.applyStyle(compactStyle, button);
+            button.setMargin(JBUI.insets(1, 8));
+        }
     }
 
     private @NotNull JPanel buildLayout() {
@@ -205,20 +234,20 @@ public final class DubboInvokePanel {
         JPanel appActionPanel = new JPanel();
         appActionPanel.setLayout(new javax.swing.BoxLayout(appActionPanel, javax.swing.BoxLayout.X_AXIS));
         appActionPanel.add(refreshButton);
-        appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(6)));
+        appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(COMPACT_GAP)));
         appActionPanel.add(favoriteCurrentButton);
-        appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(6)));
+        appActionPanel.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(COMPACT_GAP)));
         appActionPanel.add(favoritesButton);
 
         JPanel appRow = new JPanel();
         appRow.setLayout(new javax.swing.BoxLayout(appRow, javax.swing.BoxLayout.X_AXIS));
         appRow.add(applicationComboBox);
-        appRow.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(8)));
+        appRow.add(javax.swing.Box.createHorizontalStrut(JBUI.scale(COMPACT_GAP)));
         appRow.add(appActionPanel);
         appRow.add(javax.swing.Box.createHorizontalGlue());
         installAdaptiveAppComboWidth(appRow, appActionPanel, appComboHeight);
 
-        JPanel interfaceRow = new JPanel(new BorderLayout(JBUI.scale(8), 0));
+        JPanel interfaceRow = new JPanel(new BorderLayout(JBUI.scale(COMPACT_GAP), 0));
         interfaceRow.add(interfaceComboBox, BorderLayout.CENTER);
 
         JPanel actionPanel = new JPanel();
@@ -230,15 +259,15 @@ public final class DubboInvokePanel {
         copyResultButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
         resetButton.setAlignmentX(JComponent.CENTER_ALIGNMENT);
         actionPanel.add(invokeButton);
-        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(COMPACT_GAP)));
         actionPanel.add(resolveAddressButton);
-        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(COMPACT_GAP)));
         actionPanel.add(pasteParamButton);
-        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(COMPACT_GAP)));
         actionPanel.add(copyParamButton);
-        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(COMPACT_GAP)));
         actionPanel.add(copyResultButton);
-        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(8)));
+        actionPanel.add(javax.swing.Box.createVerticalStrut(JBUI.scale(COMPACT_GAP)));
         actionPanel.add(resetButton);
 
         JBScrollPane parameterScroll = new JBScrollPane(parameterTextArea);
@@ -246,7 +275,7 @@ public final class DubboInvokePanel {
         parameterScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
         parameterScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
 
-        JPanel parameterRow = new JPanel(new BorderLayout(JBUI.scale(8), 0));
+        JPanel parameterRow = new JPanel(new BorderLayout(JBUI.scale(COMPACT_GAP), 0));
         parameterRow.add(parameterScroll, BorderLayout.CENTER);
         parameterRow.add(actionPanel, BorderLayout.EAST);
 
@@ -258,7 +287,7 @@ public final class DubboInvokePanel {
         JBLabel consoleTitleLabel = new JBLabel("Console");
         consoleTitleLabel.setFont(consoleTitleLabel.getFont().deriveFont(Font.BOLD));
 
-        JPanel consoleHeader = new JPanel(new BorderLayout(JBUI.scale(8), 0));
+        JPanel consoleHeader = new JPanel(new BorderLayout(JBUI.scale(COMPACT_GAP), 0));
         consoleHeader.add(consoleTitleLabel, BorderLayout.WEST);
         consoleHeader.add(consoleLatestLabel, BorderLayout.CENTER);
 
@@ -268,7 +297,7 @@ public final class DubboInvokePanel {
         consoleScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
         consoleScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
 
-        JPanel consolePanel = new JPanel(new BorderLayout(JBUI.scale(8), JBUI.scale(6)));
+        JPanel consolePanel = new JPanel(new BorderLayout(JBUI.scale(COMPACT_GAP), JBUI.scale(COMPACT_GAP)));
         consolePanel.setBorder(JBUI.Borders.compound(
                 JBUI.Borders.customLine(JBColor.border(), 1),
                 JBUI.Borders.empty(8, 10)
@@ -284,12 +313,24 @@ public final class DubboInvokePanel {
                 .addLabeledComponent("结果", resultScroll, 1, false)
                 .getPanel();
         adjustFormLabelAnchor(topPanel, resultScroll, GridBagConstraints.WEST);
+        applySmallStyleToFormLabels(topPanel);
 
-        JPanel rootPanel = new JPanel(new BorderLayout(0, JBUI.scale(8)));
+        JPanel rootPanel = new JPanel(new BorderLayout(0, JBUI.scale(COMPACT_GAP)));
         rootPanel.setBorder(JBUI.Borders.empty(2, 12, 0, 12));
         rootPanel.add(topPanel, BorderLayout.CENTER);
         rootPanel.add(consolePanel, BorderLayout.SOUTH);
         return rootPanel;
+    }
+
+    private void applySmallStyleToFormLabels(@NotNull Container container) {
+        for (java.awt.Component component : container.getComponents()) {
+            if (component instanceof JLabel label) {
+                UIUtil.applyStyle(UIUtil.ComponentStyle.SMALL, label);
+            }
+            if (component instanceof Container nestedContainer) {
+                applySmallStyleToFormLabels(nestedContainer);
+            }
+        }
     }
 
     private void adjustFormLabelAnchor(@NotNull JPanel formPanel, @NotNull JComponent labeledComponent, int anchor) {
@@ -312,7 +353,7 @@ public final class DubboInvokePanel {
     private void installAdaptiveAppComboWidth(@NotNull JPanel appRow, @NotNull JPanel appActionPanel, int comboHeight) {
         final int minWidth = JBUI.scale(100);
         final int maxWidth = JBUI.scale(170);
-        final int gapWidth = JBUI.scale(8);
+        final int gapWidth = JBUI.scale(COMPACT_GAP);
 
         Runnable adjustWidth = () -> {
             int rowWidth = appRow.getWidth();
@@ -695,9 +736,9 @@ public final class DubboInvokePanel {
 
         List<String> consumerApplications = endpoint.getConsumerApplications();
         if (consumerApplications.isEmpty()) {
-            appendResolvedFieldLine("消费方", "未发现", consoleWarningStyle);
+            appendResolvedFieldLine("消费应用", "未发现", consoleWarningStyle);
         } else {
-            appendResolvedFieldLine("消费方", String.join("|", consumerApplications), consoleInfoStyle);
+            appendResolvedFieldLine("消费应用", String.join("|", consumerApplications), consoleInfoStyle);
         }
 
         Integer timeoutMillis = endpoint.getTimeoutMillis();
@@ -709,9 +750,9 @@ public final class DubboInvokePanel {
 
         String serviceVersion = endpoint.getServiceVersion();
         if (serviceVersion.isBlank()) {
-            appendResolvedFieldLine("接口包版本", "未配置", consoleWarningStyle);
+            appendResolvedFieldLine("二方包版本", "未配置", consoleWarningStyle);
         } else {
-            appendResolvedFieldLine("接口包版本", serviceVersion, consoleInfoStyle);
+            appendResolvedFieldLine("二方包版本", serviceVersion, consoleInfoStyle);
         }
         String dubboVersion = endpoint.getDubboVersion();
         if (dubboVersion.isBlank()) {

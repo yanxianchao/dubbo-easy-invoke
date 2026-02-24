@@ -335,7 +335,7 @@ public final class ZooKeeperDubboRegistryClient {
         String remoteApplication = queryValues.get("remote.application");
         String methods = queryValues.get("methods");
         String timeout = queryValues.get("timeout");
-        // “接口包版本”要求取 revision，不再读取 default.version。
+        // “二方包版本”要求取 revision，不再读取 default.version。
         String revision = queryValues.get("revision");
         String dubbo = queryValues.get("dubbo");
         String packageRevision = revision == null ? "" : revision.trim();

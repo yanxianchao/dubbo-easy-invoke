@@ -5,6 +5,7 @@ import com.github.yanxianchao.dubboeasyinvoke.settings.DubboInvokeSettingsServic
 import com.intellij.openapi.ui.DialogWrapper;
 import com.intellij.openapi.ui.Messages;
 import com.intellij.ui.DocumentAdapter;
+import com.intellij.ui.OnePixelSplitter;
 import com.intellij.ui.components.JBLabel;
 import com.intellij.ui.components.JBList;
 import com.intellij.ui.components.JBScrollPane;
@@ -18,12 +19,14 @@ import javax.swing.Box;
 import javax.swing.DefaultCellEditor;
 import javax.swing.JButton;
 import javax.swing.JComponent;
+import javax.swing.JLabel;
 import javax.swing.JPanel;
-import javax.swing.JSplitPane;
 import javax.swing.JTable;
 import javax.swing.ListSelectionModel;
+import javax.swing.SwingConstants;
 import javax.swing.event.DocumentEvent;
 import javax.swing.table.AbstractTableModel;
+import javax.swing.table.TableCellRenderer;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.util.ArrayList;
@@ -84,6 +87,10 @@ public final class FavoriteBrowserDialog extends DialogWrapper {
 
         JPanel topActionPanel = new JPanel();
         topActionPanel.setLayout(new javax.swing.BoxLayout(topActionPanel, javax.swing.BoxLayout.X_AXIS));
+        // 顶部工具行增加左侧内边距：
+        // 1) 避免“关键字”贴着中间分割线；
+        // 2) 与下方表格表头文字（如“收藏名”）的起始位置更一致。
+        topActionPanel.setBorder(JBUI.Borders.emptyLeft(8));
         topActionPanel.add(new JBLabel("关键字"));
         topActionPanel.add(Box.createHorizontalStrut(JBUI.scale(6)));
         topActionPanel.add(keywordField);
@@ -95,10 +102,10 @@ public final class FavoriteBrowserDialog extends DialogWrapper {
         rightPanel.add(topActionPanel, BorderLayout.NORTH);
         rightPanel.add(new JBScrollPane(favoriteTable), BorderLayout.CENTER);
 
-        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftPanel, rightPanel);
+        OnePixelSplitter splitPane = new OnePixelSplitter(false, 0.14f);
+        splitPane.setFirstComponent(leftPanel);
+        splitPane.setSecondComponent(rightPanel);
         splitPane.setBorder(JBUI.Borders.empty());
-        splitPane.setResizeWeight(0.14);
-        splitPane.setContinuousLayout(true);
 
         rootPanel = new JPanel(new BorderLayout());
         rootPanel.setPreferredSize(new Dimension(JBUI.scale(900), JBUI.scale(480)));
@@ -152,12 +159,31 @@ public final class FavoriteBrowserDialog extends DialogWrapper {
         favoriteTable.getColumnModel().getColumn(1).setPreferredWidth(JBUI.scale(70));
         favoriteTable.getColumnModel().getColumn(1).setMaxWidth(JBUI.scale(120));
         favoriteTable.getColumnModel().getColumn(2).setPreferredWidth(JBUI.scale(420));
+        alignTableHeaderToLeft();
 
         DefaultCellEditor nameEditor = new DefaultCellEditor(new JBTextField());
         nameEditor.setClickCountToStart(1);
         favoriteTable.getColumnModel().getColumn(0).setCellEditor(nameEditor);
 
         deleteFavoriteButton.addActionListener(event -> deleteSelectedFavorite());
+    }
+
+    private void alignTableHeaderToLeft() {
+        TableCellRenderer defaultHeaderRenderer = favoriteTable.getTableHeader().getDefaultRenderer();
+        favoriteTable.getTableHeader().setDefaultRenderer((table, value, isSelected, hasFocus, row, column) -> {
+            java.awt.Component component = defaultHeaderRenderer.getTableCellRendererComponent(
+                    table,
+                    value,
+                    isSelected,
+                    hasFocus,
+                    row,
+                    column
+            );
+            if (component instanceof JLabel label) {
+                label.setHorizontalAlignment(SwingConstants.LEFT);
+            }
+            return component;
+        });
     }
 
     private void reloadFavorites(@Nullable String preferredApplication, @Nullable String preferredFavoriteId) {

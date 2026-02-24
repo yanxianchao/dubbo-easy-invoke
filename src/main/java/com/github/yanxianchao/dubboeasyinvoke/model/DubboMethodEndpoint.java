@@ -11,7 +11,7 @@ import java.util.Objects;
  * Dubbo 单个可调用方法的定位信息。
  *
  * <p>这个对象表示“把请求打到哪里 + 调哪个方法 + 关联展示信息”：
- * 应用、接口、方法、host:port，以及解析接口时展示的超时/版本/消费方列表。</p>
+ * 应用、接口、方法、host:port，以及解析接口时展示的超时/版本/消费应用列表。</p>
  */
 public final class DubboMethodEndpoint {
     private final String application;
@@ -140,7 +140,7 @@ public final class DubboMethodEndpoint {
             return List.of();
         }
 
-        // 消费方列表来自注册中心，可能有空值/重复/大小写不同，这里统一清洗后再展示。
+        // 消费应用列表来自注册中心，可能有空值/重复/大小写不同，这里统一清洗后再展示。
         List<String> normalized = new ArrayList<>();
         for (String value : values) {
             if (value == null) {
