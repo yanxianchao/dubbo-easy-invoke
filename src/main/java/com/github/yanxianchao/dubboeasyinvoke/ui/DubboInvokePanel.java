@@ -7,11 +7,12 @@ import com.github.yanxianchao.dubboeasyinvoke.model.InvokeFavorite;
 import com.github.yanxianchao.dubboeasyinvoke.registry.ZooKeeperDubboRegistryClient;
 import com.github.yanxianchao.dubboeasyinvoke.settings.DubboInvokeSettingsService;
 import com.github.yanxianchao.dubboeasyinvoke.util.JsonFormatter;
+import com.intellij.openapi.Disposable;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.ide.CopyPasteManager;
 import com.intellij.openapi.ui.ComboBox;
-import com.intellij.ui.JBColor;
 import com.intellij.ui.DocumentAdapter;
+import com.intellij.ui.JBColor;
 import com.intellij.ui.components.JBLabel;
 import com.intellij.ui.components.JBScrollPane;
 import com.intellij.ui.components.JBTextArea;
@@ -21,39 +22,20 @@ import com.intellij.util.ui.UIUtil;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-import javax.swing.JButton;
-import javax.swing.JComponent;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.JScrollPane;
-import javax.swing.SwingConstants;
-import javax.swing.JTextField;
-import javax.swing.JTextPane;
-import javax.swing.SwingUtilities;
+import javax.swing.*;
 import javax.swing.event.DocumentEvent;
 import javax.swing.text.BadLocationException;
 import javax.swing.text.SimpleAttributeSet;
 import javax.swing.text.StyleConstants;
 import javax.swing.text.StyledDocument;
-import java.awt.Color;
-import java.awt.BorderLayout;
-import java.awt.Container;
-import java.awt.Dimension;
-import java.awt.Font;
-import java.awt.FontMetrics;
-import java.awt.GridBagConstraints;
-import java.awt.GridBagLayout;
+import java.awt.*;
 import java.awt.datatransfer.DataFlavor;
 import java.awt.datatransfer.StringSelection;
-import java.awt.event.FocusAdapter;
-import java.awt.event.FocusEvent;
-import java.awt.event.ItemEvent;
-import java.awt.event.ComponentAdapter;
-import java.awt.event.ComponentEvent;
+import java.awt.event.*;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.*;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -66,7 +48,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>这个类偏“编排层”，真正的数据获取和网络调用分别交给
  * {@link ZooKeeperDubboRegistryClient} 与 {@link DubboTelnetClient}。</p>
  */
-public final class DubboInvokePanel {
+public final class DubboInvokePanel implements Disposable {
 
     private static final DateTimeFormatter CONSOLE_TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final int COMPACT_GAP = 4;
@@ -126,8 +108,13 @@ public final class DubboInvokePanel {
     private final ZooKeeperDubboRegistryClient registryClient = new ZooKeeperDubboRegistryClient();
     private final DubboTelnetClient telnetClient = new DubboTelnetClient();
     private final AtomicLong refreshRequestSeq = new AtomicLong(0);
+    private final AtomicLong subscriptionSeq = new AtomicLong(0);
 
     private volatile DiscoverySnapshot discoverySnapshot = DiscoverySnapshot.empty();
+    private volatile @Nullable ZooKeeperDubboRegistryClient.DiscoverySubscription registrySubscription;
+    private volatile @Nullable String activeApplicationName;
+    private volatile boolean muteApplicationSelectionStatus;
+    private volatile boolean disposed;
 
     public DubboInvokePanel() {
         this.applicationSearchController = new SearchableComboBoxController<>(applicationComboBox, value -> value);
@@ -144,6 +131,12 @@ public final class DubboInvokePanel {
 
     public @NotNull JComponent getComponent() {
         return mainPanel;
+    }
+
+    @Override
+    public void dispose() {
+        disposed = true;
+        stopRegistrySubscription();
     }
 
     private void initComboEditors() {
@@ -404,14 +397,22 @@ public final class DubboInvokePanel {
                 return;
             }
 
+            if (appName.equals(activeApplicationName)) {
+                return;
+            }
+
             // 应用发生变化时，先清空接口列表与输入状态，再加载新应用的接口。
             interfaceSearchController.setSelectedItem(null);
             interfaceSearchController.setItems(List.of());
-            syncInterfacesByApplication(appName);
+            syncInterfacesByApplication(appName, !muteApplicationSelectionStatus);
         });
     }
 
     private void reloadApplications(boolean forceRefresh) {
+        if (disposed) {
+            return;
+        }
+
         String zkAddress = DubboInvokeSettingsService.getInstance().getZookeeperAddress();
         if (zkAddress.isBlank()) {
             setStatus("请先在 Settings > Tools > Dubbo Easy Invoke 配置 Zookeeper 地址。");
@@ -420,16 +421,18 @@ public final class DubboInvokePanel {
 
         // 通过递增请求号防止并发请求“后到先覆盖”的问题。
         long requestId = refreshRequestSeq.incrementAndGet();
+        stopRegistrySubscription();
         setBusyState(true, "正在加载应用和接口...");
         ApplicationManager.getApplication().executeOnPooledThread(() -> {
             try {
                 ZooKeeperDubboRegistryClient.DiscoverResult result = registryClient.discoverWithSource(zkAddress, forceRefresh);
                 DiscoverySnapshot snapshot = result.getSnapshot();
                 ApplicationManager.getApplication().invokeLater(() -> {
-                    if (isStaleRefreshRequest(requestId)) {
+                    if (disposed || isStaleRefreshRequest(requestId)) {
                         return;
                     }
                     applyDiscovery(snapshot);
+                    restartRegistrySubscription(requestId, zkAddress, snapshot);
                     setBusyState(false, initialLoadMessage(result.getSource()));
                     if (!forceRefresh) {
                         startBackgroundRefreshIfNeeded(requestId, zkAddress, snapshot, result.getSource());
@@ -437,7 +440,7 @@ public final class DubboInvokePanel {
                 });
             } catch (Exception ex) {
                 ApplicationManager.getApplication().invokeLater(() -> {
-                    if (isStaleRefreshRequest(requestId)) {
+                    if (disposed || isStaleRefreshRequest(requestId)) {
                         return;
                     }
                     setBusyState(false, "加载失败");
@@ -463,7 +466,7 @@ public final class DubboInvokePanel {
                 ZooKeeperDubboRegistryClient.DiscoverResult latest = registryClient.discoverWithSource(zkAddress, true);
                 DiscoverySnapshot latestSnapshot = latest.getSnapshot();
                 ApplicationManager.getApplication().invokeLater(() -> {
-                    if (isStaleRefreshRequest(requestId)) {
+                    if (disposed || isStaleRefreshRequest(requestId)) {
                         return;
                     }
 
@@ -473,11 +476,12 @@ public final class DubboInvokePanel {
                     }
 
                     applyDiscovery(latestSnapshot);
+                    restartRegistrySubscription(requestId, zkAddress, latestSnapshot);
                     setStatus("后台已刷新到最新应用和接口");
                 });
             } catch (Exception ex) {
                 ApplicationManager.getApplication().invokeLater(() -> {
-                    if (isStaleRefreshRequest(requestId)) {
+                    if (disposed || isStaleRefreshRequest(requestId)) {
                         return;
                     }
                     setStatus("后台刷新失败: " + ex.getMessage());
@@ -490,6 +494,169 @@ public final class DubboInvokePanel {
         return requestId != refreshRequestSeq.get();
     }
 
+    private void restartRegistrySubscription(
+            long requestId,
+            @NotNull String zkAddress,
+            @NotNull DiscoverySnapshot snapshot
+    ) {
+        if (disposed || isStaleRefreshRequest(requestId)) {
+            return;
+        }
+
+        stopRegistrySubscription();
+        long subscriptionId = subscriptionSeq.incrementAndGet();
+        try {
+            ZooKeeperDubboRegistryClient.DiscoverySubscription subscription = registryClient.subscribe(
+                    zkAddress,
+                    snapshot,
+                    new ZooKeeperDubboRegistryClient.DiscoverySubscriptionListener() {
+                        @Override
+                        public void onSnapshotUpdated(@NotNull DiscoverySnapshot latestSnapshot) {
+                            ApplicationManager.getApplication().invokeLater(() -> {
+                                if (disposed
+                                        || subscriptionId != subscriptionSeq.get()
+                                        || isStaleRefreshRequest(requestId)) {
+                                    return;
+                                }
+                                String selectedApplication = applicationSearchController.getSelectedItem();
+                                String changeMessage = buildAddressChangeStatusMessageForSelectedApplication(
+                                        discoverySnapshot,
+                                        latestSnapshot,
+                                        selectedApplication
+                                );
+                                applyDiscovery(latestSnapshot, false);
+                                if (changeMessage != null) {
+                                    setStatus(changeMessage);
+                                }
+                            });
+                        }
+
+                        @Override
+                        public void onError(@NotNull String message, @Nullable Throwable error) {
+                            ApplicationManager.getApplication().invokeLater(() -> {
+                                if (disposed || subscriptionId != subscriptionSeq.get()) {
+                                    return;
+                                }
+                                setStatus(message);
+                            });
+                        }
+                    }
+            );
+
+            if (disposed || subscriptionId != subscriptionSeq.get() || isStaleRefreshRequest(requestId)) {
+                subscription.close();
+                return;
+            }
+
+            registrySubscription = subscription;
+            int serviceCount = subscription.getServiceCount();
+            if (serviceCount > 0) {
+                setStatus("已订阅 " + serviceCount + " 个服务，地址变化将自动同步");
+            } else {
+                setStatus("当前无可订阅服务，等待手动刷新");
+            }
+        } catch (Exception ex) {
+            if (!disposed && subscriptionId == subscriptionSeq.get() && !isStaleRefreshRequest(requestId)) {
+                setStatus("订阅服务失败: " + ex.getMessage());
+            }
+        }
+    }
+
+    private void stopRegistrySubscription() {
+        subscriptionSeq.incrementAndGet();
+        ZooKeeperDubboRegistryClient.DiscoverySubscription current = registrySubscription;
+        registrySubscription = null;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.close();
+        } catch (Exception ignored) {
+            // ignore close failures
+        }
+    }
+
+    private @Nullable String buildAddressChangeStatusMessageForSelectedApplication(
+            @NotNull DiscoverySnapshot previousSnapshot,
+            @NotNull DiscoverySnapshot latestSnapshot,
+            @Nullable String selectedApplication
+    ) {
+        if (selectedApplication == null || selectedApplication.isBlank()) {
+            return null;
+        }
+
+        List<AddressChange> changes = collectAddressChanges(previousSnapshot, latestSnapshot);
+        if (changes.isEmpty()) {
+            return null;
+        }
+
+        List<AddressChange> selectedAppChanges = changes.stream()
+                .filter(change -> selectedApplication.equals(change.application()))
+                .toList();
+        if (selectedAppChanges.isEmpty()) {
+            return null;
+        }
+
+        AddressChange firstChange = selectedAppChanges.get(0);
+        String baseMessage = "检测到服务变更，应用 "
+                + firstChange.application()
+                + "，老IP地址 "
+                + firstChange.oldAddress()
+                + "，新IP地址 "
+                + firstChange.newAddress();
+        if (selectedAppChanges.size() == 1) {
+            return baseMessage;
+        }
+        return baseMessage + "（另有 " + (selectedAppChanges.size() - 1) + " 个接口地址同时变更）";
+    }
+
+    private @NotNull List<AddressChange> collectAddressChanges(
+            @NotNull DiscoverySnapshot previousSnapshot,
+            @NotNull DiscoverySnapshot latestSnapshot
+    ) {
+        Map<EndpointKey, DubboMethodEndpoint> previousEndpoints = indexEndpoints(previousSnapshot);
+        Map<EndpointKey, DubboMethodEndpoint> latestEndpoints = indexEndpoints(latestSnapshot);
+        if (previousEndpoints.isEmpty() || latestEndpoints.isEmpty()) {
+            return List.of();
+        }
+
+        List<AddressChange> changes = new ArrayList<>();
+        for (Map.Entry<EndpointKey, DubboMethodEndpoint> entry : previousEndpoints.entrySet()) {
+            EndpointKey key = entry.getKey();
+            DubboMethodEndpoint latest = latestEndpoints.get(key);
+            if (latest == null) {
+                continue;
+            }
+
+            DubboMethodEndpoint previous = entry.getValue();
+            if (previous.getHost().equals(latest.getHost()) && previous.getPort() == latest.getPort()) {
+                continue;
+            }
+
+            changes.add(new AddressChange(
+                    key.application(),
+                    formatAddress(previous),
+                    formatAddress(latest)
+            ));
+        }
+        return changes;
+    }
+
+    private @NotNull Map<EndpointKey, DubboMethodEndpoint> indexEndpoints(@NotNull DiscoverySnapshot snapshot) {
+        Map<EndpointKey, DubboMethodEndpoint> indexed = new HashMap<>();
+        for (String appName : snapshot.getApplications()) {
+            for (DubboMethodEndpoint endpoint : snapshot.getInterfacesForApp(appName)) {
+                EndpointKey key = new EndpointKey(appName, endpoint.getServiceName(), endpoint.getMethodName());
+                indexed.put(key, endpoint);
+            }
+        }
+        return indexed;
+    }
+
+    private @NotNull String formatAddress(@NotNull DubboMethodEndpoint endpoint) {
+        return endpoint.getHost() + ":" + endpoint.getPort();
+    }
+
     private @NotNull String initialLoadMessage(@NotNull ZooKeeperDubboRegistryClient.DataSource source) {
         return switch (source) {
             case MEMORY_CACHE -> "缓存命中（内存），加载完成";
@@ -500,45 +667,95 @@ public final class DubboInvokePanel {
     }
 
     private void applyDiscovery(@NotNull DiscoverySnapshot snapshot) {
-        this.discoverySnapshot = snapshot;
+        applyDiscovery(snapshot, true);
+    }
 
-        List<String> apps = snapshot.getApplications();
-        applicationSearchController.setItems(apps);
-        if (apps.isEmpty()) {
-            interfaceSearchController.setItems(List.of());
-            applicationSearchController.setSelectedItem(null);
-            interfaceSearchController.setSelectedItem(null);
-            setStatus("未发现应用，请确认 Zookeeper 中存在 Dubbo provider 数据。");
+    private void applyDiscovery(@NotNull DiscoverySnapshot snapshot, boolean emitStatus) {
+        if (disposed) {
             return;
         }
+        this.discoverySnapshot = snapshot;
 
-        String selectedApp = applicationSearchController.getSelectedItem();
-        if (selectedApp == null || !apps.contains(selectedApp)) {
-            // 当历史选中值已失效（比如应用下线）时，自动回到第一个可用应用。
-            selectedApp = apps.get(0);
-            applicationSearchController.setSelectedItem(selectedApp);
+        boolean previousMuteState = muteApplicationSelectionStatus;
+        muteApplicationSelectionStatus = !emitStatus;
+        List<String> apps = snapshot.getApplications();
+        try {
+            applicationSearchController.setItems(apps);
+            if (apps.isEmpty()) {
+                interfaceSearchController.setItems(List.of());
+                applicationSearchController.setSelectedItem(null);
+                interfaceSearchController.setSelectedItem(null);
+                activeApplicationName = null;
+                if (emitStatus) {
+                    setStatus("未发现应用，请确认 Zookeeper 中存在 Dubbo provider 数据。");
+                }
+                return;
+            }
+
+            String selectedApp = applicationSearchController.getSelectedItem();
+            if (selectedApp == null || !apps.contains(selectedApp)) {
+                // 当历史选中值已失效（比如应用下线）时，自动回到第一个可用应用。
+                selectedApp = apps.get(0);
+                applicationSearchController.setSelectedItem(selectedApp);
+            }
+
+            syncInterfacesByApplication(selectedApp, emitStatus);
+            if (emitStatus) {
+                setStatus("已加载 " + snapshot.getApplicationCount() + " 个应用");
+            }
+        } finally {
+            muteApplicationSelectionStatus = previousMuteState;
         }
-
-        syncInterfacesByApplication(selectedApp);
-        setStatus("已加载 " + snapshot.getApplicationCount() + " 个应用");
     }
 
     private void syncInterfacesByApplication(@NotNull String appName) {
+        syncInterfacesByApplication(appName, true);
+    }
+
+    private void syncInterfacesByApplication(@NotNull String appName, boolean emitStatus) {
         List<DubboMethodEndpoint> interfaces = discoverySnapshot.getInterfacesForApp(appName);
+        DubboMethodEndpoint previousSelection = interfaceSearchController.getSelectedItem();
         interfaceSearchController.setItems(interfaces);
+        activeApplicationName = appName;
 
         if (interfaces.isEmpty()) {
             interfaceSearchController.setSelectedItem(null);
-            setStatus("应用 " + appName + " 下无可调用接口");
+            if (emitStatus) {
+                setStatus("应用 " + appName + " 下无可调用接口");
+            }
             return;
         }
 
-        DubboMethodEndpoint selected = interfaceSearchController.getSelectedItem();
-        if (selected == null || !interfaces.contains(selected)) {
-            interfaceSearchController.setSelectedItem(interfaces.get(0));
+        DubboMethodEndpoint selected = findBestSelection(interfaces, previousSelection);
+        interfaceSearchController.setSelectedItem(selected);
+
+        if (emitStatus) {
+            setStatus("应用 " + appName + "（" + selected.getHost() + ":" + selected.getPort() + "） 共 " + interfaces.size()
+                    + " 个接口");
+        }
+    }
+
+    private @NotNull DubboMethodEndpoint findBestSelection(
+            @NotNull List<DubboMethodEndpoint> interfaces,
+            @Nullable DubboMethodEndpoint previousSelection
+    ) {
+        if (previousSelection == null) {
+            return interfaces.get(0);
         }
 
-        setStatus("应用 " + appName + " 共 " + interfaces.size() + " 个接口");
+        for (DubboMethodEndpoint endpoint : interfaces) {
+            if (endpoint.equals(previousSelection)) {
+                return endpoint;
+            }
+        }
+
+        for (DubboMethodEndpoint endpoint : interfaces) {
+            if (endpoint.getServiceName().equals(previousSelection.getServiceName())
+                    && endpoint.getMethodName().equals(previousSelection.getMethodName())) {
+                return endpoint;
+            }
+        }
+        return interfaces.get(0);
     }
 
     private void invokeSelectedInterface() {
@@ -830,6 +1047,9 @@ public final class DubboInvokePanel {
     }
 
     private void setBusyState(boolean busy, @NotNull String message) {
+        if (disposed) {
+            return;
+        }
         // 一次性切换所有交互控件，避免某个按钮遗漏导致并发操作。
         refreshButton.setEnabled(!busy);
         invokeButton.setEnabled(!busy);
@@ -843,6 +1063,9 @@ public final class DubboInvokePanel {
     }
 
     private void setStatus(@NotNull String text) {
+        if (disposed) {
+            return;
+        }
         if (!ApplicationManager.getApplication().isDispatchThread()) {
             ApplicationManager.getApplication().invokeLater(() -> setStatus(text));
             return;
@@ -914,5 +1137,19 @@ public final class DubboInvokePanel {
         StyleConstants.setForeground(attributes, color);
         StyleConstants.setBold(attributes, bold);
         return attributes;
+    }
+
+    private record EndpointKey(
+            @NotNull String application,
+            @NotNull String serviceName,
+            @NotNull String methodName
+    ) {
+    }
+
+    private record AddressChange(
+            @NotNull String application,
+            @NotNull String oldAddress,
+            @NotNull String newAddress
+    ) {
     }
 }

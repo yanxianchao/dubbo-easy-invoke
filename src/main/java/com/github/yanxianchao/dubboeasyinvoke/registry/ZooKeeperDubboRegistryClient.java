@@ -25,10 +25,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -36,6 +40,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Dubbo 注册中心读取器（Zookeeper 实现）。
@@ -56,6 +61,31 @@ public final class ZooKeeperDubboRegistryClient {
 
     private static final ObjectMapper CACHE_MAPPER = new ObjectMapper();
     private static final Map<String, CacheEntry> MEMORY_CACHE = new ConcurrentHashMap<>();
+
+    public interface DiscoverySubscription extends AutoCloseable {
+        int getServiceCount();
+
+        @Override
+        void close();
+    }
+
+    public interface DiscoverySubscriptionListener {
+        void onSnapshotUpdated(@NotNull DiscoverySnapshot snapshot);
+
+        void onError(@NotNull String message, @Nullable Throwable error);
+    }
+
+    public @NotNull DiscoverySubscription subscribe(
+            @NotNull String zkAddress,
+            @NotNull DiscoverySnapshot baselineSnapshot,
+            @NotNull DiscoverySubscriptionListener listener
+    ) throws Exception {
+        String normalizedAddress = zkAddress.trim();
+        if (normalizedAddress.isEmpty()) {
+            throw new IllegalArgumentException("请先配置 Zookeeper 地址");
+        }
+        return new ServiceSubscription(normalizedAddress, extractServiceNodes(baselineSnapshot), baselineSnapshot, listener);
+    }
 
     public @NotNull DiscoverySnapshot discover(@NotNull String zkAddress) throws Exception {
         return discover(zkAddress, false);
@@ -264,6 +294,11 @@ public final class ZooKeeperDubboRegistryClient {
     }
 
     private @NotNull ZooKeeper connect(@NotNull String zkAddress) throws IOException, InterruptedException {
+        return connect(zkAddress, null);
+    }
+
+    private @NotNull ZooKeeper connect(@NotNull String zkAddress, @Nullable Watcher sessionWatcher)
+            throws IOException, InterruptedException {
         CountDownLatch connectedLatch = new CountDownLatch(1);
 
         ZooKeeper zooKeeper = new ZooKeeper(zkAddress, SESSION_TIMEOUT_MS, new Watcher() {
@@ -271,6 +306,9 @@ public final class ZooKeeperDubboRegistryClient {
             public void process(WatchedEvent event) {
                 if (event.getState() == Event.KeeperState.SyncConnected) {
                     connectedLatch.countDown();
+                }
+                if (sessionWatcher != null) {
+                    sessionWatcher.process(event);
                 }
             }
         });
@@ -335,10 +373,8 @@ public final class ZooKeeperDubboRegistryClient {
         String remoteApplication = queryValues.get("remote.application");
         String methods = queryValues.get("methods");
         String timeout = queryValues.get("timeout");
-        // “二方包版本”要求取 revision，不再读取 default.version。
-        String revision = queryValues.get("revision");
+        String packageRevision = resolveServiceVersion(queryValues);
         String dubbo = queryValues.get("dubbo");
-        String packageRevision = revision == null ? "" : revision.trim();
         String dubboVersion = dubbo == null ? "" : dubbo.trim();
 
         return new ProviderMetadata(
@@ -348,6 +384,56 @@ public final class ZooKeeperDubboRegistryClient {
                 packageRevision,
                 dubboVersion
         );
+    }
+
+    private @NotNull String resolveServiceVersion(@NotNull Map<String, String> queryValues) {
+        String revision = normalizeQueryValue(queryValues.get("revision"));
+        String artifact = normalizeQueryValue(queryValues.get("artifact"));
+        String release = normalizeQueryValue(queryValues.get("release"));
+
+        if (artifact != null && revision != null) {
+            if (isGenericServiceVersion(revision)) {
+                return composeArtifactRevision(artifact, revision);
+            }
+            if (revision.startsWith(artifact + "-")) {
+                return revision;
+            }
+        }
+
+        if (revision != null) {
+            return revision;
+        }
+        if (release != null) {
+            return release;
+        }
+        return "";
+    }
+
+    private @Nullable String normalizeQueryValue(@Nullable String rawValue) {
+        if (rawValue == null) {
+            return null;
+        }
+        String trimmed = rawValue.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    private boolean isGenericServiceVersion(@NotNull String value) {
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return normalized.equals("snapshot")
+                || normalized.equals("release")
+                || normalized.equals("unknown");
+    }
+
+    private @NotNull String composeArtifactRevision(@NotNull String artifact, @NotNull String revision) {
+        String normalizedArtifact = artifact.trim();
+        String normalizedRevision = revision.trim();
+        if (normalizedArtifact.isEmpty()) {
+            return normalizedRevision;
+        }
+        if (normalizedRevision.startsWith(normalizedArtifact + "-")) {
+            return normalizedRevision;
+        }
+        return normalizedArtifact + "-" + normalizedRevision;
     }
 
     private @NotNull Map<String, String> parseQueryValues(@NotNull String queryPart) {
@@ -422,6 +508,19 @@ public final class ZooKeeperDubboRegistryClient {
                 .distinct()
                 .sorted(String.CASE_INSENSITIVE_ORDER)
                 .toList();
+    }
+
+    private @NotNull List<String> extractServiceNodes(@NotNull DiscoverySnapshot snapshot) {
+        Set<String> serviceNodes = new TreeSet<>();
+        for (String appName : snapshot.getApplications()) {
+            for (DubboMethodEndpoint endpoint : snapshot.getInterfacesForApp(appName)) {
+                String serviceName = endpoint.getServiceName();
+                if (serviceName != null && !serviceName.isBlank()) {
+                    serviceNodes.add(serviceName);
+                }
+            }
+        }
+        return List.copyOf(serviceNodes);
     }
 
     private @Nullable DiscoverySnapshot getMemoryCache(@NotNull String zkAddress, long nowMillis) {
@@ -589,6 +688,370 @@ public final class ZooKeeperDubboRegistryClient {
             this.timeoutMillis = timeoutMillis;
             this.serviceVersion = serviceVersion;
             this.dubboVersion = dubboVersion;
+        }
+    }
+
+    private @NotNull Map<String, List<DubboMethodEndpoint>> groupEndpointsByService(@NotNull DiscoverySnapshot snapshot) {
+        Map<String, List<DubboMethodEndpoint>> grouped = new TreeMap<>();
+        for (String appName : snapshot.getApplications()) {
+            for (DubboMethodEndpoint endpoint : snapshot.getInterfacesForApp(appName)) {
+                grouped.computeIfAbsent(endpoint.getServiceName(), ignored -> new ArrayList<>()).add(endpoint);
+            }
+        }
+
+        Map<String, List<DubboMethodEndpoint>> immutable = new TreeMap<>();
+        for (Map.Entry<String, List<DubboMethodEndpoint>> entry : grouped.entrySet()) {
+            List<DubboMethodEndpoint> endpoints = new ArrayList<>(entry.getValue());
+            endpoints.sort(Comparator
+                    .comparing(DubboMethodEndpoint::getDisplayName, String.CASE_INSENSITIVE_ORDER)
+                    .thenComparing(DubboMethodEndpoint::getHost, String.CASE_INSENSITIVE_ORDER)
+                    .thenComparingInt(DubboMethodEndpoint::getPort));
+            immutable.put(entry.getKey(), List.copyOf(endpoints));
+        }
+        return immutable;
+    }
+
+    private @NotNull DiscoverySnapshot buildSnapshotFromServiceEndpoints(
+            @NotNull Map<String, List<DubboMethodEndpoint>> endpointsByService
+    ) {
+        Map<String, Map<String, DubboMethodEndpoint>> groupedByApp = new TreeMap<>();
+        for (List<DubboMethodEndpoint> endpoints : endpointsByService.values()) {
+            for (DubboMethodEndpoint endpoint : endpoints) {
+                mergeEndpoint(groupedByApp, endpoint);
+            }
+        }
+        return buildSnapshot(groupedByApp);
+    }
+
+    private void closeQuietly(@Nullable ZooKeeper zooKeeper) {
+        if (zooKeeper == null) {
+            return;
+        }
+        try {
+            zooKeeper.close();
+        } catch (Exception ignored) {
+            // ignore
+        }
+    }
+
+    private final class ServiceSubscription implements DiscoverySubscription {
+        private final String zkAddress;
+        private final List<String> serviceNodes;
+        private final DiscoverySubscriptionListener listener;
+        private final Map<String, List<DubboMethodEndpoint>> endpointsByService = new TreeMap<>();
+        private final ExecutorService watchExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "dubbo-easy-invoke-subscription");
+            thread.setDaemon(true);
+            return thread;
+        });
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+        private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+
+        private volatile ZooKeeper zooKeeper;
+        private volatile DiscoverySnapshot latestSnapshot = DiscoverySnapshot.empty();
+
+        private ServiceSubscription(
+                @NotNull String zkAddress,
+                @NotNull List<String> serviceNodes,
+                @NotNull DiscoverySnapshot baselineSnapshot,
+                @NotNull DiscoverySubscriptionListener listener
+        ) throws Exception {
+            this.zkAddress = zkAddress;
+            this.serviceNodes = List.copyOf(new LinkedHashSet<>(serviceNodes));
+            this.listener = listener;
+
+            Map<String, List<DubboMethodEndpoint>> baselineByService = groupEndpointsByService(baselineSnapshot);
+            for (String serviceNode : this.serviceNodes) {
+                endpointsByService.put(serviceNode, baselineByService.getOrDefault(serviceNode, List.of()));
+            }
+            latestSnapshot = buildSnapshotFromServiceEndpoints(endpointsByService);
+
+            if (this.serviceNodes.isEmpty()) {
+                return;
+            }
+
+            this.zooKeeper = connect(this.zkAddress, this::handleSessionEvent);
+            enqueue(this::refreshAllServices);
+        }
+
+        @Override
+        public int getServiceCount() {
+            return serviceNodes.size();
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            watchExecutor.shutdownNow();
+            closeQuietly(zooKeeper);
+        }
+
+        private void handleSessionEvent(@NotNull WatchedEvent event) {
+            if (closed.get() || event.getType() != Watcher.Event.EventType.None) {
+                return;
+            }
+
+            if (event.getState() == Watcher.Event.KeeperState.Expired) {
+                scheduleReconnect("Zookeeper 会话已过期，正在自动重连...");
+                return;
+            }
+
+            if (event.getState() == Watcher.Event.KeeperState.SyncConnected && reconnecting.get()) {
+                enqueue(this::refreshAllServices);
+            }
+        }
+
+        private void handleServicePathEvent(@NotNull String serviceNode, @NotNull WatchedEvent event) {
+            if (closed.get()) {
+                return;
+            }
+
+            if (event.getType() == Watcher.Event.EventType.None) {
+                if (event.getState() == Watcher.Event.KeeperState.Expired) {
+                    scheduleReconnect("订阅通道已过期，正在自动重连...");
+                }
+                return;
+            }
+
+            switch (event.getType()) {
+                case NodeChildrenChanged, NodeCreated, NodeDeleted, NodeDataChanged -> enqueue(() -> refreshOneService(serviceNode));
+                default -> {
+                    // ignore
+                }
+            }
+        }
+
+        private void refreshAllServices() {
+            if (closed.get()) {
+                return;
+            }
+
+            for (String serviceNode : serviceNodes) {
+                try {
+                    endpointsByService.put(serviceNode, loadServiceEndpoints(serviceNode));
+                } catch (Exception ex) {
+                    notifyError("订阅刷新失败(" + serviceNode + "): " + ex.getMessage(), ex);
+                    if (isRecoverableConnectionError(ex)) {
+                        scheduleReconnect("订阅连接异常，正在自动重连...");
+                        return;
+                    }
+                }
+            }
+            publishSnapshotIfChanged();
+        }
+
+        private void refreshOneService(@NotNull String serviceNode) {
+            if (closed.get()) {
+                return;
+            }
+
+            try {
+                endpointsByService.put(serviceNode, loadServiceEndpoints(serviceNode));
+                publishSnapshotIfChanged();
+            } catch (Exception ex) {
+                notifyError("订阅更新失败(" + serviceNode + "): " + ex.getMessage(), ex);
+                if (isRecoverableConnectionError(ex)) {
+                    scheduleReconnect("订阅连接异常，正在自动重连...");
+                }
+            }
+        }
+
+        private @NotNull List<DubboMethodEndpoint> loadServiceEndpoints(@NotNull String serviceNode) throws Exception {
+            ZooKeeper currentClient = zooKeeper;
+            if (currentClient == null) {
+                return List.of();
+            }
+
+            List<String> consumerApplications = discoverConsumerApplicationsWithWatch(currentClient, serviceNode);
+            String providersPath = DUBBO_ROOT + "/" + serviceNode + "/providers";
+            List<String> providers = getChildrenWithWatch(
+                    currentClient,
+                    providersPath,
+                    event -> handleServicePathEvent(serviceNode, event)
+            );
+            if (providers.isEmpty()) {
+                return List.of();
+            }
+
+            List<String> sortedProviders = new ArrayList<>(providers);
+            sortedProviders.sort(String.CASE_INSENSITIVE_ORDER);
+
+            List<DubboMethodEndpoint> endpoints = new ArrayList<>();
+            for (String encodedProvider : sortedProviders) {
+                ProviderNode providerNode = parseProviderNode(serviceNode, encodedProvider);
+                if (providerNode == null) {
+                    continue;
+                }
+                for (String method : providerNode.methods) {
+                    endpoints.add(new DubboMethodEndpoint(
+                            providerNode.application,
+                            providerNode.serviceName,
+                            method,
+                            providerNode.host,
+                            providerNode.port,
+                            providerNode.timeoutMillis,
+                            providerNode.serviceVersion,
+                            providerNode.dubboVersion,
+                            consumerApplications
+                    ));
+                }
+            }
+
+            if (endpoints.isEmpty()) {
+                return List.of();
+            }
+            endpoints.sort(Comparator
+                    .comparing(DubboMethodEndpoint::getDisplayName, String.CASE_INSENSITIVE_ORDER)
+                    .thenComparing(DubboMethodEndpoint::getHost, String.CASE_INSENSITIVE_ORDER)
+                    .thenComparingInt(DubboMethodEndpoint::getPort));
+            return List.copyOf(endpoints);
+        }
+
+        private @NotNull List<String> discoverConsumerApplicationsWithWatch(
+                @NotNull ZooKeeper zooKeeper,
+                @NotNull String serviceNode
+        ) throws Exception {
+            String consumersPath = DUBBO_ROOT + "/" + serviceNode + "/consumers";
+            List<String> consumers = getChildrenWithWatch(
+                    zooKeeper,
+                    consumersPath,
+                    event -> handleServicePathEvent(serviceNode, event)
+            );
+            if (consumers.isEmpty()) {
+                return List.of();
+            }
+
+            List<String> applications = new ArrayList<>();
+            for (String encodedConsumer : consumers) {
+                String consumerApplication = parseConsumerApplication(encodedConsumer);
+                if (consumerApplication == null) {
+                    continue;
+                }
+                if (!containsIgnoreCase(applications, consumerApplication)) {
+                    applications.add(consumerApplication);
+                }
+            }
+            if (applications.isEmpty()) {
+                return List.of();
+            }
+            applications.sort(String.CASE_INSENSITIVE_ORDER);
+            return List.copyOf(applications);
+        }
+
+        private @NotNull List<String> getChildrenWithWatch(
+                @NotNull ZooKeeper zooKeeper,
+                @NotNull String path,
+                @NotNull Watcher watcher
+        ) throws Exception {
+            try {
+                return zooKeeper.getChildren(path, watcher);
+            } catch (KeeperException.NoNodeException ignored) {
+                try {
+                    zooKeeper.exists(path, watcher);
+                } catch (KeeperException.NoNodeException alsoMissing) {
+                    // ignore
+                }
+                return List.of();
+            }
+        }
+
+        private void scheduleReconnect(@NotNull String statusMessage) {
+            if (closed.get() || serviceNodes.isEmpty()) {
+                return;
+            }
+            if (!reconnecting.compareAndSet(false, true)) {
+                return;
+            }
+            notifyError(statusMessage, null);
+            enqueue(this::reconnectLoop);
+        }
+
+        private void reconnectLoop() {
+            while (!closed.get()) {
+                try {
+                    ZooKeeper nextClient = connect(zkAddress, this::handleSessionEvent);
+                    ZooKeeper previousClient = zooKeeper;
+                    zooKeeper = nextClient;
+                    closeQuietly(previousClient);
+                    reconnecting.set(false);
+                    refreshAllServices();
+                    return;
+                } catch (Exception ex) {
+                    notifyError("重连 Zookeeper 失败，2 秒后重试: " + ex.getMessage(), ex);
+                    sleepSilently(2000);
+                }
+            }
+            reconnecting.set(false);
+        }
+
+        private void publishSnapshotIfChanged() {
+            DiscoverySnapshot nextSnapshot = buildSnapshotFromServiceEndpoints(endpointsByService);
+            if (nextSnapshot.equals(latestSnapshot)) {
+                return;
+            }
+
+            latestSnapshot = nextSnapshot;
+            long now = System.currentTimeMillis();
+            putMemoryCache(zkAddress, nextSnapshot, now);
+            writeDiskCache(zkAddress, nextSnapshot, now);
+
+            try {
+                listener.onSnapshotUpdated(nextSnapshot);
+            } catch (Exception listenerError) {
+                notifyError("订阅回调执行失败: " + listenerError.getMessage(), listenerError);
+            }
+        }
+
+        private void notifyError(@NotNull String message, @Nullable Throwable error) {
+            try {
+                listener.onError(message, error);
+            } catch (Exception ignored) {
+                // ignore listener failures
+            }
+        }
+
+        private void enqueue(@NotNull Runnable task) {
+            if (closed.get()) {
+                return;
+            }
+            try {
+                watchExecutor.execute(() -> {
+                    if (closed.get()) {
+                        return;
+                    }
+                    task.run();
+                });
+            } catch (Exception ignored) {
+                // ignore rejected tasks during shutdown
+            }
+        }
+
+        private void sleepSilently(long millis) {
+            try {
+                Thread.sleep(millis);
+            } catch (InterruptedException interruptedException) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        private boolean isRecoverableConnectionError(@NotNull Exception ex) {
+            if (ex instanceof KeeperException.ConnectionLossException
+                    || ex instanceof KeeperException.SessionExpiredException
+                    || ex instanceof KeeperException.SessionMovedException) {
+                return true;
+            }
+            Throwable cause = ex.getCause();
+            while (cause != null) {
+                if (cause instanceof KeeperException.ConnectionLossException
+                        || cause instanceof KeeperException.SessionExpiredException
+                        || cause instanceof KeeperException.SessionMovedException) {
+                    return true;
+                }
+                cause = cause.getCause();
+            }
+            return false;
         }
     }
 

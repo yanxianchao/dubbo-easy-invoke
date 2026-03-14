@@ -20,6 +20,7 @@ public final class DubboInvokeToolWindowFactory implements ToolWindowFactory, Du
     public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
         DubboInvokePanel panel = new DubboInvokePanel();
         Content content = ContentFactory.getInstance().createContent(panel.getComponent(), "", false);
+        content.setDisposer(panel);
         toolWindow.getContentManager().addContent(content);
     }
 }
