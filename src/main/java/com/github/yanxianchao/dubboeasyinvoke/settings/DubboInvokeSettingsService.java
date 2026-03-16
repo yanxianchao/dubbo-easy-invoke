@@ -53,7 +53,7 @@ public final class DubboInvokeSettingsService implements PersistentStateComponen
     }
 
     public static final class State {
-        public String zookeeperAddress = "127.0.0.1:2181";
+        public String zookeeperAddress = "10.55.0.157:2181";
         public List<FavoriteState> favorites = new ArrayList<>();
     }
 
