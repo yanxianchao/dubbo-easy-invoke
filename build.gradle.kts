@@ -41,6 +41,11 @@ tasks {
         sourceCompatibility = "21"
         targetCompatibility = "21"
     }
+
+    // 禁用 instrumentation 任务以解决 Microsoft JDK 不包含 Packages 目录的问题
+    instrumentCode {
+        enabled = false
+    }
 }
 
 java {
