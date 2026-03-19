@@ -519,7 +519,7 @@ public final class DubboInvokePanel implements Disposable {
                                     return;
                                 }
                                 String selectedApplication = applicationSearchController.getSelectedItem();
-                                String changeMessage = buildAddressChangeStatusMessageForSelectedApplication(
+                                String changeMessage = buildApplicationAddressChangeStatusMessage(
                                         discoverySnapshot,
                                         latestSnapshot,
                                         selectedApplication
@@ -576,7 +576,7 @@ public final class DubboInvokePanel implements Disposable {
         }
     }
 
-    private @Nullable String buildAddressChangeStatusMessageForSelectedApplication(
+    private @Nullable String buildApplicationAddressChangeStatusMessage(
             @NotNull DiscoverySnapshot previousSnapshot,
             @NotNull DiscoverySnapshot latestSnapshot,
             @Nullable String selectedApplication
@@ -585,42 +585,42 @@ public final class DubboInvokePanel implements Disposable {
             return null;
         }
 
-        List<AddressChange> changes = collectAddressChanges(previousSnapshot, latestSnapshot);
-        if (changes.isEmpty()) {
+        ApplicationAddressChangeSummary summary = collectApplicationAddressChanges(previousSnapshot, latestSnapshot)
+                .get(selectedApplication);
+        if (summary == null) {
             return null;
         }
 
-        List<AddressChange> selectedAppChanges = changes.stream()
-                .filter(change -> selectedApplication.equals(change.application()))
-                .toList();
-        if (selectedAppChanges.isEmpty()) {
-            return null;
+        String baseMessage = "检测到应用 "
+                + summary.getApplication()
+                + " 地址变更，涉及 "
+                + summary.getChangedInterfaceCount()
+                + " 个接口";
+        if (summary.getOldAddresses().size() == 1 && summary.getNewAddresses().size() == 1) {
+            return baseMessage
+                    + "，地址由 "
+                    + summary.getOldAddresses().iterator().next()
+                    + " 切换到 "
+                    + summary.getNewAddresses().iterator().next();
         }
-
-        AddressChange firstChange = selectedAppChanges.get(0);
-        String baseMessage = "检测到服务变更，应用 "
-                + firstChange.application()
-                + "，老IP地址 "
-                + firstChange.oldAddress()
-                + "，新IP地址 "
-                + firstChange.newAddress();
-        if (selectedAppChanges.size() == 1) {
-            return baseMessage;
-        }
-        return baseMessage + "（另有 " + (selectedAppChanges.size() - 1) + " 个接口地址同时变更）";
+        return baseMessage
+                + "，旧地址 "
+                + formatAddressSet(summary.getOldAddresses())
+                + "，新地址 "
+                + formatAddressSet(summary.getNewAddresses());
     }
 
-    private @NotNull List<AddressChange> collectAddressChanges(
+    private @NotNull Map<String, ApplicationAddressChangeSummary> collectApplicationAddressChanges(
             @NotNull DiscoverySnapshot previousSnapshot,
             @NotNull DiscoverySnapshot latestSnapshot
     ) {
         Map<EndpointKey, DubboMethodEndpoint> previousEndpoints = indexEndpoints(previousSnapshot);
         Map<EndpointKey, DubboMethodEndpoint> latestEndpoints = indexEndpoints(latestSnapshot);
         if (previousEndpoints.isEmpty() || latestEndpoints.isEmpty()) {
-            return List.of();
+            return Map.of();
         }
 
-        List<AddressChange> changes = new ArrayList<>();
+        Map<String, ApplicationAddressChangeSummary> changes = new TreeMap<>();
         for (Map.Entry<EndpointKey, DubboMethodEndpoint> entry : previousEndpoints.entrySet()) {
             EndpointKey key = entry.getKey();
             DubboMethodEndpoint latest = latestEndpoints.get(key);
@@ -633,11 +633,12 @@ public final class DubboInvokePanel implements Disposable {
                 continue;
             }
 
-            changes.add(new AddressChange(
-                    key.application(),
-                    formatAddress(previous),
-                    formatAddress(latest)
-            ));
+            changes.computeIfAbsent(key.application(), ApplicationAddressChangeSummary::new)
+                    .addChange(
+                            key.serviceName(),
+                            formatAddress(previous),
+                            formatAddress(latest)
+                    );
         }
         return changes;
     }
@@ -655,6 +656,20 @@ public final class DubboInvokePanel implements Disposable {
 
     private @NotNull String formatAddress(@NotNull DubboMethodEndpoint endpoint) {
         return endpoint.getHost() + ":" + endpoint.getPort();
+    }
+
+    private @NotNull String formatAddressSet(@NotNull Set<String> addresses) {
+        if (addresses.isEmpty()) {
+            return "未发现";
+        }
+        if (addresses.size() <= 2) {
+            return String.join(" / ", addresses);
+        }
+
+        Iterator<String> iterator = addresses.iterator();
+        String first = iterator.next();
+        String second = iterator.next();
+        return first + " / " + second + " 等 " + addresses.size() + " 个";
     }
 
     private @NotNull String initialLoadMessage(@NotNull ZooKeeperDubboRegistryClient.DataSource source) {
@@ -1146,10 +1161,40 @@ public final class DubboInvokePanel implements Disposable {
     ) {
     }
 
-    private record AddressChange(
-            @NotNull String application,
-            @NotNull String oldAddress,
-            @NotNull String newAddress
-    ) {
+    private static final class ApplicationAddressChangeSummary {
+        private final String application;
+        private final Set<String> changedInterfaces = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        private final Set<String> oldAddresses = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        private final Set<String> newAddresses = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+
+        private ApplicationAddressChangeSummary(@NotNull String application) {
+            this.application = application;
+        }
+
+        private void addChange(
+                @NotNull String serviceName,
+                @NotNull String oldAddress,
+                @NotNull String newAddress
+        ) {
+            changedInterfaces.add(serviceName);
+            oldAddresses.add(oldAddress);
+            newAddresses.add(newAddress);
+        }
+
+        private @NotNull String getApplication() {
+            return application;
+        }
+
+        private int getChangedInterfaceCount() {
+            return changedInterfaces.size();
+        }
+
+        private @NotNull Set<String> getOldAddresses() {
+            return oldAddresses;
+        }
+
+        private @NotNull Set<String> getNewAddresses() {
+            return newAddresses;
+        }
     }
 }
