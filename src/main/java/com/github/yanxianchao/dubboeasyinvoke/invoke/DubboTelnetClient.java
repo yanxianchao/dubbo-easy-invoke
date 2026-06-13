@@ -126,7 +126,7 @@ public final class DubboTelnetClient {
             }
         }
 
-        if (resultBuilder.length() > 0) {
+        if (!resultBuilder.isEmpty()) {
             return resultBuilder.toString().trim();
         }
 
