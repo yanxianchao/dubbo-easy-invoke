@@ -4,6 +4,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.TreeSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -127,12 +128,17 @@ public final class DubboMethodEndpoint {
                 && application.equals(that.application)
                 && serviceName.equals(that.serviceName)
                 && methodName.equals(that.methodName)
-                && host.equals(that.host);
+                && host.equals(that.host)
+                && Objects.equals(timeoutMillis, that.timeoutMillis)
+                && serviceVersion.equals(that.serviceVersion)
+                && dubboVersion.equals(that.dubboVersion)
+                && consumerApplications.equals(that.consumerApplications);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(application, serviceName, methodName, host, port);
+        return Objects.hash(application, serviceName, methodName, host, port,
+                timeoutMillis, serviceVersion, dubboVersion, consumerApplications);
     }
 
     private @NotNull List<String> sanitizeConsumerApplications(@Nullable List<String> values) {
@@ -140,33 +146,16 @@ public final class DubboMethodEndpoint {
             return List.of();
         }
 
-        // 消费应用列表来自注册中心，可能有空值/重复/大小写不同，这里统一清洗后再展示。
-        List<String> normalized = new ArrayList<>();
+        TreeSet<String> seen = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         for (String value : values) {
             if (value == null) {
                 continue;
             }
             String trimmed = value.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            if (!containsIgnoreCase(normalized, trimmed)) {
-                normalized.add(trimmed);
+            if (!trimmed.isEmpty()) {
+                seen.add(trimmed);
             }
         }
-        if (normalized.isEmpty()) {
-            return List.of();
-        }
-        normalized.sort(String.CASE_INSENSITIVE_ORDER);
-        return List.copyOf(normalized);
-    }
-
-    private boolean containsIgnoreCase(@NotNull List<String> values, @NotNull String target) {
-        for (String value : values) {
-            if (value.equalsIgnoreCase(target)) {
-                return true;
-            }
-        }
-        return false;
+        return seen.isEmpty() ? List.of() : List.copyOf(seen);
     }
 }

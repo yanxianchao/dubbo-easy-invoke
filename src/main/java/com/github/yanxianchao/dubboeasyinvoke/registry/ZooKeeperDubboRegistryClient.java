@@ -37,10 +37,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Dubbo 注册中心读取器（Zookeeper 实现）。
@@ -54,8 +56,6 @@ public final class ZooKeeperDubboRegistryClient {
 
     private static final String DUBBO_ROOT = "/dubbo";
     private static final int SESSION_TIMEOUT_MS = 6000;
-    private static final int MAX_FETCH_THREADS = 24;
-
     private static final long MEMORY_CACHE_TTL_MS = TimeUnit.SECONDS.toMillis(45);
     private static final long DISK_CACHE_MAX_AGE_MS = TimeUnit.HOURS.toMillis(24);
 
@@ -148,8 +148,7 @@ public final class ZooKeeperDubboRegistryClient {
             }
 
             Map<String, Map<String, DubboMethodEndpoint>> groupedByApp = new TreeMap<>();
-            int workerCount = Math.max(4, Math.min(MAX_FETCH_THREADS, Runtime.getRuntime().availableProcessors() * 2));
-            ExecutorService executor = Executors.newFixedThreadPool(workerCount);
+            ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
             try {
                 // 每个 service 节点并发拉取，明显减少大集群下的首屏等待。
@@ -237,21 +236,14 @@ public final class ZooKeeperDubboRegistryClient {
             return List.of();
         }
 
-        List<String> applications = new ArrayList<>();
+        TreeSet<String> applications = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         for (String encodedConsumer : consumers) {
             String consumerApplication = parseConsumerApplication(encodedConsumer);
-            if (consumerApplication == null) {
-                continue;
-            }
-            if (!containsIgnoreCase(applications, consumerApplication)) {
+            if (consumerApplication != null) {
                 applications.add(consumerApplication);
             }
         }
-        if (applications.isEmpty()) {
-            return List.of();
-        }
-        applications.sort(String.CASE_INSENSITIVE_ORDER);
-        return List.copyOf(applications);
+        return applications.isEmpty() ? List.of() : List.copyOf(applications);
     }
 
     private @Nullable String parseConsumerApplication(@NotNull String encodedConsumer) {
@@ -492,15 +484,6 @@ public final class ZooKeeperDubboRegistryClient {
         }
     }
 
-    private boolean containsIgnoreCase(@NotNull List<String> values, @NotNull String candidate) {
-        for (String value : values) {
-            if (value.equalsIgnoreCase(candidate)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     private @NotNull List<String> splitMethods(@NotNull String methodsRaw) {
         return Arrays.stream(methodsRaw.split(","))
                 .map(String::trim)
@@ -538,6 +521,11 @@ public final class ZooKeeperDubboRegistryClient {
     }
 
     private void putMemoryCache(@NotNull String zkAddress, @NotNull DiscoverySnapshot snapshot, long nowMillis) {
+        if (MEMORY_CACHE.size() > 16) {
+            MEMORY_CACHE.entrySet().removeIf(entry ->
+                    nowMillis - entry.getValue().cachedAtMillis > MEMORY_CACHE_TTL_MS
+            );
+        }
         MEMORY_CACHE.put(zkAddress, new CacheEntry(snapshot, nowMillis));
     }
 
@@ -618,8 +606,36 @@ public final class ZooKeeperDubboRegistryClient {
             } catch (Exception ignored) {
                 Files.move(tempFile, cacheFile, StandardCopyOption.REPLACE_EXISTING);
             }
+
+            cleanStaleDiskCacheFiles(cacheFile, nowMillis);
         } catch (Exception ignored) {
             // 缓存写入失败不影响主流程
+        }
+    }
+
+    private void cleanStaleDiskCacheFiles(@NotNull Path currentCacheFile, long nowMillis) {
+        Path cacheDir = currentCacheFile.getParent();
+        if (cacheDir == null || !Files.isDirectory(cacheDir)) {
+            return;
+        }
+        try (var stream = Files.list(cacheDir)) {
+            stream.filter(path -> {
+                        String name = path.getFileName().toString();
+                        return (name.startsWith("zk-") && (name.endsWith(".json") || name.endsWith(".tmp")))
+                                && !path.equals(currentCacheFile);
+                    })
+                    .forEach(path -> {
+                        try {
+                            long lastModified = Files.getLastModifiedTime(path).toMillis();
+                            if (nowMillis - lastModified > DISK_CACHE_MAX_AGE_MS * 7) {
+                                Files.deleteIfExists(path);
+                            }
+                        } catch (Exception ignored) {
+                            // ignore
+                        }
+                    });
+        } catch (Exception ignored) {
+            // ignore
         }
     }
 
@@ -735,17 +751,24 @@ public final class ZooKeeperDubboRegistryClient {
     }
 
     private final class ServiceSubscription implements DiscoverySubscription {
+        private static final long RECONNECT_DELAY_MS = 2000;
+        private static final int MAX_RECONNECT_ATTEMPTS = 15;
+        private static final long WATCH_RETRY_DELAY_MS = 3000;
+        private static final int MAX_WATCH_RETRIES = 5;
+
         private final String zkAddress;
         private final List<String> serviceNodes;
         private final DiscoverySubscriptionListener listener;
         private final Map<String, List<DubboMethodEndpoint>> endpointsByService = new TreeMap<>();
-        private final ExecutorService watchExecutor = Executors.newSingleThreadExecutor(runnable -> {
+        private final ScheduledExecutorService watchExecutor = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "dubbo-easy-invoke-subscription");
             thread.setDaemon(true);
             return thread;
         });
         private final AtomicBoolean closed = new AtomicBoolean(false);
         private final AtomicBoolean reconnecting = new AtomicBoolean(false);
+        private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
+        private final Set<String> knownRootServices = ConcurrentHashMap.newKeySet();
 
         private volatile ZooKeeper zooKeeper;
         private volatile DiscoverySnapshot latestSnapshot = DiscoverySnapshot.empty();
@@ -767,11 +790,18 @@ public final class ZooKeeperDubboRegistryClient {
             latestSnapshot = buildSnapshotFromServiceEndpoints(endpointsByService);
 
             if (this.serviceNodes.isEmpty()) {
+                watchExecutor.shutdownNow();
                 return;
             }
 
-            this.zooKeeper = connect(this.zkAddress, this::handleSessionEvent);
+            try {
+                this.zooKeeper = connect(this.zkAddress, this::handleSessionEvent);
+            } catch (Exception ex) {
+                watchExecutor.shutdownNow();
+                throw ex;
+            }
             enqueue(this::refreshAllServices);
+            enqueue(this::watchRootForNewServices);
         }
 
         @Override
@@ -836,6 +866,8 @@ public final class ZooKeeperDubboRegistryClient {
                     if (isRecoverableConnectionError(ex)) {
                         scheduleReconnect("订阅连接异常，正在自动重连...");
                         return;
+                    } else {
+                        scheduleWatchRetry(serviceNode, 1);
                     }
                 }
             }
@@ -854,7 +886,109 @@ public final class ZooKeeperDubboRegistryClient {
                 notifyError("订阅更新失败(" + serviceNode + "): " + ex.getMessage(), ex);
                 if (isRecoverableConnectionError(ex)) {
                     scheduleReconnect("订阅连接异常，正在自动重连...");
+                } else {
+                    scheduleWatchRetry(serviceNode, 1);
                 }
+            }
+        }
+
+        private void scheduleWatchRetry(@NotNull String serviceNode, int attempt) {
+            if (closed.get() || attempt > MAX_WATCH_RETRIES) {
+                if (attempt > MAX_WATCH_RETRIES) {
+                    notifyError("服务 " + serviceNode + " 监听恢复失败，已达最大重试次数", null);
+                }
+                return;
+            }
+            try {
+                watchExecutor.schedule(() -> {
+                    if (closed.get()) {
+                        return;
+                    }
+                    try {
+                        endpointsByService.put(serviceNode, loadServiceEndpoints(serviceNode));
+                        publishSnapshotIfChanged();
+                    } catch (Exception retryEx) {
+                        notifyError("服务 " + serviceNode + " 监听重试失败(" + attempt + "): " + retryEx.getMessage(), retryEx);
+                        if (isRecoverableConnectionError(retryEx)) {
+                            scheduleReconnect("订阅连接异常，正在自动重连...");
+                        } else {
+                            scheduleWatchRetry(serviceNode, attempt + 1);
+                        }
+                    }
+                }, WATCH_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
+            } catch (Exception ignored) {
+                // ignore rejected tasks during shutdown
+            }
+        }
+
+        private void watchRootForNewServices() {
+            if (closed.get()) {
+                return;
+            }
+            ZooKeeper currentClient = zooKeeper;
+            if (currentClient == null) {
+                return;
+            }
+            try {
+                List<String> currentServices = currentClient.getChildren(DUBBO_ROOT, event -> {
+                    if (closed.get()) {
+                        return;
+                    }
+                    if (event.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
+                        enqueue(this::checkForNewServices);
+                    }
+                });
+                knownRootServices.addAll(currentServices);
+            } catch (Exception ex) {
+                notifyError("监听根节点失败: " + ex.getMessage(), ex);
+            }
+        }
+
+        private void checkForNewServices() {
+            if (closed.get()) {
+                return;
+            }
+            ZooKeeper currentClient = zooKeeper;
+            if (currentClient == null) {
+                return;
+            }
+            try {
+                List<String> latestServices = currentClient.getChildren(DUBBO_ROOT, event -> {
+                    if (closed.get()) {
+                        return;
+                    }
+                    if (event.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
+                        enqueue(this::checkForNewServices);
+                    }
+                });
+
+                List<String> newServices = new ArrayList<>();
+                for (String svc : latestServices) {
+                    if (knownRootServices.add(svc) && !serviceNodes.contains(svc)) {
+                        newServices.add(svc);
+                    }
+                }
+
+                if (!newServices.isEmpty()) {
+                    boolean changed = false;
+                    for (String serviceNode : newServices) {
+                        try {
+                            List<DubboMethodEndpoint> endpoints = loadServiceEndpoints(serviceNode);
+                            if (!endpoints.isEmpty()) {
+                                endpointsByService.put(serviceNode, endpoints);
+                                changed = true;
+                            }
+                        } catch (Exception ex) {
+                            notifyError("加载新服务失败(" + serviceNode + "): " + ex.getMessage(), ex);
+                        }
+                    }
+                    if (changed) {
+                        publishSnapshotIfChanged();
+                        notifyError("发现 " + newServices.size() + " 个新服务并已自动订阅", null);
+                    }
+                }
+            } catch (Exception ex) {
+                notifyError("检查新服务失败: " + ex.getMessage(), ex);
             }
         }
 
@@ -923,21 +1057,14 @@ public final class ZooKeeperDubboRegistryClient {
                 return List.of();
             }
 
-            List<String> applications = new ArrayList<>();
+            TreeSet<String> applications = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
             for (String encodedConsumer : consumers) {
                 String consumerApplication = parseConsumerApplication(encodedConsumer);
-                if (consumerApplication == null) {
-                    continue;
-                }
-                if (!containsIgnoreCase(applications, consumerApplication)) {
+                if (consumerApplication != null) {
                     applications.add(consumerApplication);
                 }
             }
-            if (applications.isEmpty()) {
-                return List.of();
-            }
-            applications.sort(String.CASE_INSENSITIVE_ORDER);
-            return List.copyOf(applications);
+            return applications.isEmpty() ? List.of() : List.copyOf(applications);
         }
 
         private @NotNull List<String> getChildrenWithWatch(
@@ -964,26 +1091,46 @@ public final class ZooKeeperDubboRegistryClient {
             if (!reconnecting.compareAndSet(false, true)) {
                 return;
             }
+            reconnectAttempts.set(0);
             notifyError(statusMessage, null);
-            enqueue(this::reconnectLoop);
+            try {
+                watchExecutor.schedule(this::attemptReconnect, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
+            } catch (Exception ignored) {
+                reconnecting.set(false);
+            }
         }
 
-        private void reconnectLoop() {
-            while (!closed.get()) {
+        private void attemptReconnect() {
+            if (closed.get()) {
+                reconnecting.set(false);
+                return;
+            }
+
+            int attempt = reconnectAttempts.incrementAndGet();
+            if (attempt > MAX_RECONNECT_ATTEMPTS) {
+                reconnecting.set(false);
+                notifyError("重连 Zookeeper 已达最大重试次数(" + MAX_RECONNECT_ATTEMPTS + ")，请手动刷新", null);
+                return;
+            }
+
+            try {
+                ZooKeeper nextClient = connect(zkAddress, this::handleSessionEvent);
+                ZooKeeper previousClient = zooKeeper;
+                zooKeeper = nextClient;
+                closeQuietly(previousClient);
+                reconnecting.set(false);
+                reconnectAttempts.set(0);
+                refreshAllServices();
+                watchRootForNewServices();
+            } catch (Exception ex) {
+                notifyError("重连 Zookeeper 失败(" + attempt + "/" + MAX_RECONNECT_ATTEMPTS + ")，"
+                        + RECONNECT_DELAY_MS / 1000 + " 秒后重试: " + ex.getMessage(), ex);
                 try {
-                    ZooKeeper nextClient = connect(zkAddress, this::handleSessionEvent);
-                    ZooKeeper previousClient = zooKeeper;
-                    zooKeeper = nextClient;
-                    closeQuietly(previousClient);
+                    watchExecutor.schedule(this::attemptReconnect, RECONNECT_DELAY_MS, TimeUnit.MILLISECONDS);
+                } catch (Exception ignored) {
                     reconnecting.set(false);
-                    refreshAllServices();
-                    return;
-                } catch (Exception ex) {
-                    notifyError("重连 Zookeeper 失败，2 秒后重试: " + ex.getMessage(), ex);
-                    sleepSilently(2000);
                 }
             }
-            reconnecting.set(false);
         }
 
         private void publishSnapshotIfChanged() {
@@ -1025,14 +1172,6 @@ public final class ZooKeeperDubboRegistryClient {
                 });
             } catch (Exception ignored) {
                 // ignore rejected tasks during shutdown
-            }
-        }
-
-        private void sleepSilently(long millis) {
-            try {
-                Thread.sleep(millis);
-            } catch (InterruptedException interruptedException) {
-                Thread.currentThread().interrupt();
             }
         }
 

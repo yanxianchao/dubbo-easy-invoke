@@ -19,9 +19,13 @@ public final class DiscoverySnapshot {
     private static final DiscoverySnapshot EMPTY = new DiscoverySnapshot(Collections.emptyMap());
 
     private final Map<String, List<DubboMethodEndpoint>> appToInterfaces;
+    private final List<String> sortedApplications;
 
     public DiscoverySnapshot(@NotNull Map<String, List<DubboMethodEndpoint>> appToInterfaces) {
         this.appToInterfaces = appToInterfaces;
+        this.sortedApplications = appToInterfaces.isEmpty()
+                ? List.of()
+                : appToInterfaces.keySet().stream().sorted().toList();
     }
 
     public static @NotNull DiscoverySnapshot empty() {
@@ -29,8 +33,7 @@ public final class DiscoverySnapshot {
     }
 
     public @NotNull List<String> getApplications() {
-        // 对应用名排序后返回，保证 UI 每次展示顺序稳定。
-        return appToInterfaces.keySet().stream().sorted().toList();
+        return sortedApplications;
     }
 
     public @NotNull List<DubboMethodEndpoint> getInterfacesForApp(@NotNull String application) {
